@@ -1,0 +1,27 @@
+[package]
+name = "wici-crypto"
+description = "Device keys, pairing, and payload sealing for Wici"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+chacha20poly1305.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+hkdf.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+wici-protocol.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

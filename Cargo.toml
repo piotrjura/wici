@@ -11,10 +11,18 @@ repository = "https://github.com/piotrjura/wici"
 
 [workspace.dependencies]
 base64 = "0.22"
-uuid = { version = "1", features = ["v7", "serde"] }
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+hkdf = "0.12"
 proptest = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v7", "serde"] }
+wici-protocol = { path = "crates/wici-protocol" }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+zeroize = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
