@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use sqlx::Connection;
+
 use wici_protocol::{Blob, DeviceId, Lane, MessageId, PairId, Position};
 use wici_server::store::{Accepted, LaneKey, NewMessage, Store, StoreError, StoreLimits};
 
@@ -241,4 +243,26 @@ async fn revoke_deletes_queued_messages() {
         lane: Lane::Data,
     };
     assert_eq!(store.fetch(&key, Position(0), 10).await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn recipient_lanes_are_found_through_an_index() {
+    let url = wici_testkit::database_url().await;
+    let store = Store::connect(&url, 1, crate::support::LIMITS)
+        .await
+        .unwrap();
+    let (_, _, b) = active_pair(&store).await;
+    let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+    sqlx::query("SET enable_seqscan = off")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let plan: Vec<String> =
+        sqlx::query_scalar("EXPLAIN SELECT acked_position FROM lanes WHERE recipient = $1")
+            .bind(b.as_bytes().as_slice())
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+    let plan = plan.join("\n");
+    assert!(plan.contains("lanes_recipient"), "{plan}");
 }
