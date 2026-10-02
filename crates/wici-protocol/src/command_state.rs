@@ -1,7 +1,7 @@
 //! Command lifecycle.
 
 use crate::lifecycle::Lifecycle;
-use crate::wire::wire_enum;
+use crate::wire_enum;
 
 wire_enum! {
     /// Externally visible state of a command.

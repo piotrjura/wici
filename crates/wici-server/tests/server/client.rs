@@ -3,9 +3,7 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use wici_crypto::{DeviceKeys, Invitation, PairKeys};
@@ -13,69 +11,11 @@ use wici_protocol::frame::{decode, encode};
 use wici_protocol::{
     ClientFrame, PROTOCOL_VERSION, PairId, PairInfo, PairState, ServerFrame, Timestamp,
 };
-use wici_server::{Config, Limits, Timeouts};
+use wici_testkit::TestServer;
 
-use crate::support::store_with;
-
-pub(crate) const WAIT: Duration = Duration::from_secs(5);
+use wici_testkit::WAIT;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
-/// A running server on a fresh database.
-pub(crate) struct Server {
-    pub(crate) url: String,
-    stop: Option<oneshot::Sender<()>>,
-    task: Option<JoinHandle<std::io::Result<()>>>,
-}
-
-impl Server {
-    pub(crate) async fn start() -> Self {
-        Self::with(|_| {}).await
-    }
-
-    pub(crate) async fn with(change: impl FnOnce(&mut Config)) -> Self {
-        let mut config = Config {
-            listen: "127.0.0.1:0".parse().unwrap(),
-            database_url: String::new(),
-            database_connections: 8,
-            limits: Limits::default(),
-            timeouts: Timeouts::default(),
-        };
-        change(&mut config);
-        let store = store_with(config.limits.store).await;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}/v1/ws", listener.local_addr().unwrap());
-        let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(wici_server::serve(listener, store, config, async {
-            let _ = stopped.await;
-        }));
-        Self {
-            url,
-            stop: Some(stop),
-            task: Some(task),
-        }
-    }
-
-    pub(crate) fn http_address(&self) -> String {
-        self.url
-            .trim_start_matches("ws://")
-            .trim_end_matches("/v1/ws")
-            .to_owned()
-    }
-
-    pub(crate) async fn stop(mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(task) = self.task.take() {
-            tokio::time::timeout(WAIT, task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-        }
-    }
-}
 
 /// An authenticated device connection.
 pub(crate) struct Client {
@@ -225,7 +165,7 @@ pub(crate) struct Paired {
 }
 
 /// Pairs two new devices over the WebSocket protocol.
-pub(crate) async fn paired(server: &Server) -> Paired {
+pub(crate) async fn paired(server: &TestServer) -> Paired {
     let (mut a, _) = Client::new(&server.url).await;
     let (mut b, _) = Client::new(&server.url).await;
     let invitation = Invitation::create(&a.keys, server.url.clone(), Timestamp(0));

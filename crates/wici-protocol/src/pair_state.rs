@@ -1,7 +1,7 @@
 //! Pair lifecycle.
 
 use crate::lifecycle::Lifecycle;
-use crate::wire::wire_enum;
+use crate::wire_enum;
 
 wire_enum! {
     /// State of a pair of devices.

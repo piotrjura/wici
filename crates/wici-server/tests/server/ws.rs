@@ -8,7 +8,9 @@ use wici_protocol::{
     Position, ServerFrame, StreamId, Timestamp,
 };
 
-use crate::client::{Client, Paired, Server, expect_pair, next, open, paired, put};
+use wici_testkit::TestServer as Server;
+
+use crate::client::{Client, Paired, expect_pair, next, open, paired, put};
 
 fn event(text: &str) -> Body {
     Body::Event {
@@ -470,7 +472,7 @@ async fn overdue_invitations_expire_and_are_announced() {
 
 #[tokio::test]
 async fn health_check_and_graceful_shutdown() {
-    let server = Server::start().await;
+    let mut server = Server::start().await;
     let mut stream = tokio::net::TcpStream::connect(server.http_address())
         .await
         .unwrap();

@@ -2,7 +2,6 @@
 
 use std::time::Duration;
 
-use sqlx::Connection;
 use wici_crypto::{DeviceKeys, Invitation};
 use wici_protocol::{DeviceId, FixedBytes, PairId, Timestamp};
 use wici_server::store::{Claim, PairRecord, Store, StoreLimits, StoreResult};
@@ -21,18 +20,7 @@ pub(crate) async fn store() -> Store {
 
 /// [`store`] with custom limits.
 pub(crate) async fn store_with(limits: StoreLimits) -> Store {
-    let admin_url = std::env::var("WICI_TEST_DATABASE_URL")
-        .expect("WICI_TEST_DATABASE_URL is not set; run tests through scripts/with-postgres.sh");
-    let name = format!("wici_{}", uuid::Uuid::now_v7().simple());
-    let mut admin = sqlx::PgConnection::connect(&admin_url).await.unwrap();
-    sqlx::query(&format!("CREATE DATABASE {name}"))
-        .execute(&mut admin)
-        .await
-        .unwrap();
-    let base = admin_url.rsplit_once('/').unwrap().0;
-    Store::connect(&format!("{base}/{name}"), 16, limits)
-        .await
-        .unwrap()
+    wici_testkit::store(limits).await
 }
 
 /// A registered device with real keys.

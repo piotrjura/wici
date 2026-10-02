@@ -77,6 +77,8 @@ pub fn deserialize<'de, T: WireEnum, D: Deserializer<'de>>(deserializer: D) -> R
 }
 
 /// Defines a [`WireEnum`] with `Display`, `FromStr`, and serde support.
+/// The calling crate must depend on `serde`.
+#[macro_export]
 macro_rules! wire_enum {
     (
         $(#[$meta:meta])*
@@ -128,8 +130,6 @@ macro_rules! wire_enum {
         }
     };
 }
-
-pub(crate) use wire_enum;
 
 #[cfg(test)]
 pub(crate) mod testing {

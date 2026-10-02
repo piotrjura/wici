@@ -1,6 +1,6 @@
 [package]
-name = "wici-server"
-description = "Wici relay server: auth, pairing, durable delivery, live updates"
+name = "wici-client"
+description = "Wici device client: pairing, durable outbox and inbox, reconnect, replay"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,25 +8,23 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
-axum.workspace = true
 futures-util.workspace = true
-rand_core.workspace = true
-sha2.workspace = true
-sqlx = { workspace = true, features = ["postgres", "uuid"] }
-subtle.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, features = ["sqlite"] }
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-uuid.workspace = true
 wici-crypto.workspace = true
 wici-protocol.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 wici-testkit.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
-tokio-tungstenite.workspace = true
+wici-server.workspace = true
 
 [lints]
 workspace = true

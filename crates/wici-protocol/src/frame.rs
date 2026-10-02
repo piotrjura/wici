@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::bytes::{Blob, FixedBytes};
 use crate::id::{DeviceId, MessageId, PairId};
 use crate::pair_state::PairState;
-use crate::wire::wire_enum;
+use crate::wire_enum;
 
 /// Current wire version.
 pub const PROTOCOL_VERSION: u16 = 1;
