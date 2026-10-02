@@ -1,111 +1,89 @@
-# Wici project instructions
+# Wici rules
 
-## Purpose and plan
+Wici connects apps to AI agents on other machines: commands, events, approvals,
+results. Read [the plan](docs/project-plan.md) before changing behavior. Never
+call planned work done.
 
-Wici is an open-source Rust system that connects applications to AI agents on
-local or remote machines. It delivers commands, resumable events, approvals, and
-results through one protocol. Wici does not depend on one application, agent,
-model vendor, or cloud provider.
+## Writing
 
-Read [the project plan](docs/project-plan.md) before you change architecture or
-behavior. The plan defines the scope, the command lifecycle, the delivery rules,
-and the milestones. Never describe planned work as implemented or verified.
+- English. Shortest wording that stays clear. Applies to docs, comments,
+  errors, and commits.
+- Reply to the user briefly, in their language.
 
 ## Priorities
 
-1. Preserve accepted work, durable data, authorization, and recovery data.
-2. Recover from failures without a repeat of uncertain external actions.
-3. Keep commands and streams responsive under load.
-4. Keep the protocol general and the code readable and modular.
-5. Make self-hosting and contribution straightforward.
+1. Never lose accepted work, data, auth, or recovery state.
+2. Never repeat an uncertain external action.
+3. Stay responsive under load.
+4. Keep the protocol generic and the code modular.
+5. Keep self-hosting and contributing easy.
 
-Publish only guarantees that an explicit failure model and tests support. Never
-claim unlimited uptime or exactly-once execution of arbitrary agent tools.
+Claim only guarantees backed by a failure model and tests.
 
 ## Architecture
 
-- Keep protocol types and state machines independent of storage, network, UI,
-  agents, and cloud providers.
-- Keep SQLite and PostgreSQL adapters separate from the shared semantics.
-- Keep delivery, agent execution, and provisioning separate.
-- Build the library and the standalone binaries from the same core.
-- Keep the FFI layer thin. Never let a Rust panic cross the FFI boundary.
-- Never run agents inside the UI process of a host application.
-- Do not add application-specific operations to the protocol. Use adapters or
-  versioned extensions.
-- Add a crate or module only when real code needs it.
+- Protocol and state machines know nothing of storage, network, UI, agents,
+  or clouds.
+- SQLite and PostgreSQL adapters stay separate from shared logic.
+- Library and binaries share one core.
+- Thin FFI. No panic crosses it.
+- No app-specific operations in the protocol. Use adapters or extensions.
+- New crate or module only when real code needs it.
 
-## Code quality
+## Code
 
-- Write code, documentation, errors, and examples in clear English.
-  Reply to the user briefly in their language.
-- Follow the Rust API Guidelines and the `rustfmt.toml` of this repository.
-- One responsibility for each module and each function. Keep functions short.
-- Do not duplicate logic. Before you write a function, search for an existing
-  one and reuse or extend it. Put shared logic in one place.
-- Prefer explicit types, enums, exhaustive `match`, and typed errors.
-- Public errors keep actionable context and never contain secrets.
-- No `unwrap`, `expect`, `panic!`, or unchecked indexing outside of tests.
-- No `unsafe` outside of the FFI crate. Document each `unsafe` block.
-- Suppress a lint only with `#[expect(lint, reason = "...")]`.
-- Bound queues, tasks, buffers, payloads, retries, and concurrency. Use
-  deadlines, cancellation, backpressure, and graceful shutdown. Never block an
-  async executor with disk, CPU-heavy work, or process waits.
-- Document each public item. Include failure behavior, and for async or storage
-  code, cancellation and durability.
-- Keep wire versions separate from crate versions. Never break old peers,
-  persisted records, or migrations silently.
-- Do not choose or change the license without owner approval.
+- Rust API Guidelines and `rustfmt.toml`.
+- One job per module and function. Short functions.
+- No duplicated logic. Reuse or extend existing code first.
+- Explicit types, enums, exhaustive `match`, typed errors.
+- Errors keep context, never secrets.
+- No `unwrap`, `expect`, `panic!`, or unchecked indexing outside tests.
+- `unsafe` only in the FFI crate, each block documented.
+- Suppress lints only with `#[expect(lint, reason = "...")]`.
+- Bound queues, buffers, payloads, retries, concurrency. Use deadlines,
+  cancellation, backpressure. Never block an async executor.
+- Document public items, including failures. For async or storage code, also
+  cancellation and durability.
+- Wire versions are separate from crate versions. Never silently break peers,
+  stored records, or migrations.
+- License changes need owner approval.
 
 ## Tests
 
-Every change ships with tests in the same commit. No code exists without tests.
+No code without tests, in the same commit.
 
-- Unit tests: each function, each branch, and each error path.
-- Assumption tests: each documented rule or invariant has a test that checks it.
-- Property tests (`proptest`): state machines, ordering, IDs, and decoders.
-- Integration tests: real SQLite and PostgreSQL for storage and recovery.
-  Mocks never replace real storage and restart tests.
-- Failure tests: protocol and recovery changes need fault injection at the
-  relevant crash and restart boundaries.
-- Line coverage of the workspace must stay at or above 90 percent.
+- Unit: every function, branch, and error path.
+- Assumptions: every documented rule has a test.
+- Property (`proptest`): state machines, ordering, IDs, decoders.
+- Storage and recovery: real SQLite and PostgreSQL, not mocks.
+- Protocol and recovery changes: fault injection at crash and restart points.
+- Line coverage ≥ 90%.
 
-## Reliability rules
+## Reliability
 
-- Persist before durable acceptance. Distinguish local save, server acceptance,
-  runner receipt, execution, and completion.
-- Retry with the original ID. Bind deduplication to tenant, operation, and
-  payload.
-- After reconnect or restart, reconcile from durable state. Notifications are
-  only hints.
-- Record uncertain outcomes explicitly. Never repeat an external effect only
-  because a response was lost.
-- Self-repair is bounded, observable, and non-destructive. Never erase data,
-  regenerate identity, reset pairing, or bypass authorization.
-- Keep evidence of corrupt records and isolate their failure.
+- Persist before acknowledging.
+- Retry with the original ID. Deduplicate by tenant, operation, and payload.
+- After restart, reconcile from durable state.
+- Record uncertain outcomes. Never repeat an effect because a reply was lost.
+- Self-repair is bounded and non-destructive. Never erase data, reset
+  identity or pairing, or bypass auth.
+- Quarantine corrupt records and keep the evidence.
 
-## Verification
+## Verify
 
-Run the full check before each commit:
+Run before every commit (CI runs the same, plus macOS and MSRV):
 
 ```sh
 scripts/verify.sh
 ```
 
-The script runs formatting, Clippy, tests, documentation tests, documentation
-build, dependency audit (`cargo-deny`), coverage (`cargo-llvm-cov`), and the
-duplication check (`jscpd`). CI runs the same checks on Linux and macOS and also
-checks the MSRV.
-
 ## Commits
 
-- Commit each small step that works and passes `scripts/verify.sh`.
-- Subject: imperative mood, at most 60 characters. Say what the application can
-  do now, for example `Add command state transition rules`.
-- Body (optional): at most 3 short lines with the reason or the limits.
-- One logical change for each commit. Do not mix refactors with behavior.
-- Do not commit secrets, credentials, build output, or local settings.
+- Small, working steps that pass `scripts/verify.sh`.
+- Subject: imperative, ≤ 60 chars, what the app can do now.
+- Body: optional, ≤ 3 short lines.
+- One logical change per commit.
+- No secrets, build output, or local settings.
 
-Preserve unrelated work. Do not publish a package, deploy infrastructure, or
-change repository visibility without authorization. Report what changed, what
-was verified, and the remaining limits. Do not add work logs to these files.
+Preserve unrelated work. No publishing, deploying, or visibility changes
+without approval.
