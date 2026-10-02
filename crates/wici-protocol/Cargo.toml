@@ -8,6 +8,8 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
+uuid.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
