@@ -1,6 +1,8 @@
 # Wici project plan
 
-Status: planning. No code exists yet. All parts of this plan are planned work.
+Status: early development. The workspace, the code checks, and the command
+lifecycle in `wici-protocol` exist. All other parts of this plan are planned
+work and are not implemented.
 
 ## 1. Purpose
 
@@ -43,7 +45,7 @@ One repository and one Cargo workspace. Add a crate only when code needs it.
 
 | Crate | Responsibility | Status |
 | --- | --- | --- |
-| `wici-protocol` | Wire types, versions, validation, command lifecycle | Planned |
+| `wici-protocol` | Wire types, versions, validation, command lifecycle | Started |
 | `wici-core` | Delivery and recovery state machines, storage traits | Planned |
 | `wici-store-sqlite` | Local outbox, inbox, cursors, execution records | Planned |
 | `wici-store-postgres` | Server storage, tenancy, delivery records | Planned |
@@ -60,7 +62,8 @@ agent never runs inside the UI process of the host application.
 
 ## 4. Command lifecycle
 
-These states are visible to clients. `wici-protocol` will implement them.
+These states are visible to clients. `wici-protocol` implements them as
+`CommandState`.
 
 | State | Meaning |
 | --- | --- |
@@ -147,7 +150,7 @@ Rules of the lifecycle:
 ## 9. Milestones
 
 1. **Contract.** Command lifecycle, envelope, IDs, acknowledgements, failure
-   model.
+   model. The lifecycle is implemented. The other parts are open.
 2. **Local storage.** SQLite outbox and inbox with crash and restart tests.
 3. **Vertical slice.** Client, server with PostgreSQL, runner with a test agent.
    Live output, replay after restart, cancellation, unknown outcomes.

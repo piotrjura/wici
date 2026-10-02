@@ -1,6 +1,10 @@
 # Rust build output
 /target/
 
+# Coverage output
+lcov.info
+*.profraw
+
 # OS and editor files
 .DS_Store
 .idea/
