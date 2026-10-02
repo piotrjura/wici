@@ -29,7 +29,8 @@ fn event(text: &str) -> Body {
 }
 
 async fn received(device: &mut Device) -> wici_client::Incoming {
-    let Event::Message(message) = device.expect(|e| matches!(e, Event::Message(_))).await else {
+    let Event::Message { message } = device.expect(|e| matches!(e, Event::Message { .. })).await
+    else {
         panic!("not a message")
     };
     message

@@ -109,7 +109,7 @@ pub(crate) async fn on_pair(
     }
     db::update_pair(&mut tx, &row).await?;
     tx.commit().await?;
-    shared.emit(Event::Pair(view(&row))).await;
+    shared.emit(Event::Pair { pair: view(&row) }).await;
     if let Some(device) = claimed {
         shared
             .emit(Event::Claimed {
@@ -361,7 +361,7 @@ async fn announce(shared: &Shared, delivery: InboxRow, body: Body, effects: &Eff
             accepted_at: delivery.accepted_at,
             body,
         };
-        shared.emit(Event::Message(incoming)).await;
+        shared.emit(Event::Message { message: incoming }).await;
     }
     if let Some((id, state)) = effects.outgoing {
         shared.emit(Event::Command { pair, id, state }).await;
@@ -461,7 +461,7 @@ async fn op_failed(
     }
     db::update_pair(&mut conn, &row).await?;
     drop(conn);
-    shared.emit(Event::Pair(view(&row))).await;
+    shared.emit(Event::Pair { pair: view(&row) }).await;
     Ok(true)
 }
 
@@ -565,7 +565,7 @@ mod tests {
         let mut f = fixture(PairState::Active).await;
         let first = deliver(&f, 1, &event_body("a"));
         assert_eq!(run(&f, first.clone()).await, Some(ack(&f, 1)));
-        let Some(Event::Message(message)) = f.event() else {
+        let Some(Event::Message { message }) = f.event() else {
             panic!("no message")
         };
         assert_eq!(message.body, event_body("a"));
@@ -640,7 +640,7 @@ mod tests {
         };
         let far = u64::try_from(now_ms()).unwrap() + 60_000;
         run(&f, deliver(&f, 1, &command(far))).await;
-        assert!(matches!(f.event(), Some(Event::Message(_))));
+        assert!(matches!(f.event(), Some(Event::Message { .. })));
         run(&f, deliver(&f, 2, &command(1))).await;
         assert_eq!(f.event(), None, "expired command is not offered");
         let replies = outbox(&f).await;
@@ -668,7 +668,7 @@ mod tests {
             output: None,
         };
         run(&f, deliver(&f, 1, &status)).await;
-        assert!(matches!(f.event(), Some(Event::Message(_))));
+        assert!(matches!(f.event(), Some(Event::Message { .. })));
         assert_eq!(
             f.event(),
             Some(Event::Command {
@@ -811,7 +811,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(f.pair_row().await.pending, Some(PendingOp::Unpair));
-        assert!(matches!(f.event(), Some(Event::Pair(_))));
+        assert!(matches!(f.event(), Some(Event::Pair { .. })));
         assert_eq!(f.event(), None, "no claim event");
 
         let greeting = Some(f.invitation.greet(&f.peer_device).unwrap());
@@ -827,7 +827,7 @@ mod tests {
         .await
         .unwrap();
         assert!(f.pair_row().await.keys.is_some());
-        assert!(matches!(f.event(), Some(Event::Pair(_))));
+        assert!(matches!(f.event(), Some(Event::Pair { .. })));
         assert!(matches!(f.event(), Some(Event::Claimed { .. })));
     }
 
@@ -921,7 +921,7 @@ mod tests {
             .unwrap();
         let row = f.pair_row().await;
         assert_eq!((row.pending, row.state), (None, PairState::Expired));
-        assert!(matches!(f.event(), Some(Event::Pair(_))));
+        assert!(matches!(f.event(), Some(Event::Pair { .. })));
         assert!(matches!(
             f.event(),
             Some(Event::Failed {
@@ -950,6 +950,6 @@ mod tests {
         };
         run(&f, error).await;
         assert_eq!(f.pair_row().await.pending, None);
-        assert!(matches!(f.event(), Some(Event::Pair(_))));
+        assert!(matches!(f.event(), Some(Event::Pair { .. })));
     }
 }

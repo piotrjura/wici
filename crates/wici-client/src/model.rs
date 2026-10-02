@@ -1,5 +1,6 @@
 //! Public client data types.
 
+use serde::{Deserialize, Serialize};
 use wici_protocol::{
     Body, CommandState, DeviceId, ErrorCode, Lane, LiveBody, MessageId, PairId, PairState,
     Position, Timestamp, wire_enum,
@@ -53,7 +54,7 @@ impl PendingOp {
 }
 
 /// A pair as this device knows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairView {
     /// Pair ID.
     pub id: PairId,
@@ -68,7 +69,7 @@ pub struct PairView {
 }
 
 /// A received durable message.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Incoming {
     /// Pair ID.
     pub pair: PairId,
@@ -84,15 +85,19 @@ pub struct Incoming {
     pub body: Body,
 }
 
-/// Something the app should know about.
-#[derive(Debug, Clone, PartialEq)]
+/// Something the app should know about. Serialized with a `type` tag.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// Connected and authenticated.
     Connected,
     /// Connection lost. The client reconnects on its own.
     Disconnected,
     /// A pair changed.
-    Pair(PairView),
+    Pair {
+        /// New view.
+        pair: PairView,
+    },
     /// A device claimed this device's invitation. Call `approve` to accept.
     Claimed {
         /// Pair ID.
@@ -101,7 +106,10 @@ pub enum Event {
         device: DeviceId,
     },
     /// A durable message arrived. Call `handled` after processing it.
-    Message(Incoming),
+    Message {
+        /// The message.
+        message: Incoming,
+    },
     /// A live update arrived.
     Live {
         /// Pair ID.
@@ -189,6 +197,20 @@ mod tests {
             ),
             "outgoing,incoming"
         );
+    }
+
+    #[test]
+    fn events_have_tagged_json() {
+        let event = Event::Accepted {
+            pair: PairId::from_bytes([1; 16]),
+            id: MessageId::from_bytes([2; 16]),
+            position: Position(3),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "accepted");
+        assert_eq!(serde_json::from_value::<Event>(value).unwrap(), event);
+        let connected = serde_json::to_value(Event::Connected).unwrap();
+        assert_eq!(connected, serde_json::json!({"type": "connected"}));
     }
 
     #[test]

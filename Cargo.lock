@@ -2506,6 +2506,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wici-ffi"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "wici-client",
+ "wici-crypto",
+ "wici-protocol",
+ "wici-testkit",
+]
+
+[[package]]
 name = "wici-protocol"
 version = "0.0.0"
 dependencies = [

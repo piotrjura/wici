@@ -1,0 +1,27 @@
+[package]
+name = "wici-ffi"
+description = "C ABI for the Wici client, for native apps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+wici-client.workspace = true
+wici-crypto.workspace = true
+wici-protocol.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wici-testkit.workspace = true
+
+[lints]
+workspace = true

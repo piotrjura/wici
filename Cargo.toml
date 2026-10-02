@@ -33,6 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 wici-client = { path = "crates/wici-client" }
 wici-crypto = { path = "crates/wici-crypto" }
+wici-ffi = { path = "crates/wici-ffi" }
 wici-protocol = { path = "crates/wici-protocol" }
 wici-server = { path = "crates/wici-server" }
 wici-testkit = { path = "crates/wici-testkit" }
@@ -40,7 +41,8 @@ x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 zeroize = "1"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Only `wici-ffi` may use unsafe code, with `#[expect]` and safety comments.
+unsafe_code = "deny"
 missing_docs = "deny"
 missing_debug_implementations = "deny"
 unreachable_pub = "deny"

@@ -64,8 +64,10 @@ impl Device {
     }
 
     pub(crate) async fn expect_pair(&mut self, pair: PairId, state: PairState) {
-        self.expect(|e| matches!(e, Event::Pair(view) if view.id == pair && view.state == state))
-            .await;
+        self.expect(
+            |e| matches!(e, Event::Pair { pair: view } if view.id == pair && view.state == state),
+        )
+        .await;
     }
 }
 
