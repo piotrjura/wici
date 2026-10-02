@@ -35,7 +35,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features --locked
+      - name: Add PostgreSQL to PATH (Linux)
+        if: runner.os == 'Linux'
+        run: echo "$(ls -d /usr/lib/postgresql/*/bin | tail -1)" >> "$GITHUB_PATH"
+      - name: Install PostgreSQL (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install postgresql@16
+          echo "$(brew --prefix postgresql@16)/bin" >> "$GITHUB_PATH"
+      - run: scripts/with-postgres.sh cargo test --workspace --all-features --locked
       - run: cargo test --workspace --all-features --locked --doc
 
   msrv:
@@ -59,7 +67,15 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      - run: cargo llvm-cov --workspace --all-features --locked --fail-under-lines 90
+      - name: Add PostgreSQL to PATH (Linux)
+        if: runner.os == 'Linux'
+        run: echo "$(ls -d /usr/lib/postgresql/*/bin | tail -1)" >> "$GITHUB_PATH"
+      - name: Install PostgreSQL (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install postgresql@16
+          echo "$(brew --prefix postgresql@16)/bin" >> "$GITHUB_PATH"
+      - run: scripts/with-postgres.sh cargo llvm-cov --workspace --all-features --locked --fail-under-lines 90
 
   dependencies:
     name: Dependency audit

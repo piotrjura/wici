@@ -10,17 +10,29 @@ publish = false
 repository = "https://github.com/piotrjura/wici"
 
 [workspace.dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
 base64 = "0.22"
 chacha20poly1305 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hkdf = "0.12"
 proptest = "1"
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "uuid"] }
+subtle = "2"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = "0.30"
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v7", "serde"] }
+wici-crypto = { path = "crates/wici-crypto" }
 wici-protocol = { path = "crates/wici-protocol" }
+wici-server = { path = "crates/wici-server" }
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 zeroize = "1"
 

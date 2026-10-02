@@ -21,14 +21,15 @@ step() {
 require cargo-deny "cargo install --locked cargo-deny"
 require cargo-llvm-cov "cargo install --locked cargo-llvm-cov"
 require npx "install Node.js"
+require initdb "install PostgreSQL (initdb, pg_ctl)"
 
 step cargo fmt --all -- --check
 step cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-step cargo test --workspace --all-features --locked
+step scripts/with-postgres.sh cargo test --workspace --all-features --locked
 step cargo test --workspace --all-features --locked --doc
 RUSTDOCFLAGS="-D warnings" step cargo doc --workspace --all-features --no-deps --locked
 step cargo deny --locked check
-step cargo llvm-cov --workspace --all-features --locked --fail-under-lines "$MIN_LINE_COVERAGE"
+step scripts/with-postgres.sh cargo llvm-cov --workspace --all-features --locked --fail-under-lines "$MIN_LINE_COVERAGE"
 step npx --yes jscpd@4 --config .jscpd.json
 
 echo "All checks passed."
