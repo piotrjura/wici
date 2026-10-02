@@ -21,6 +21,7 @@
 //! ```
 
 mod aead;
+mod artifact;
 mod device;
 mod error;
 mod invitation;
@@ -28,6 +29,9 @@ mod kdf;
 mod pair;
 mod vault;
 
+pub use artifact::{
+    ArtifactKey, CHUNK_OVERHEAD, CHUNK_PLAINTEXT, artifact_hash, chunk_count, sealed_len,
+};
 pub use device::{DeviceKeys, verify_challenge};
 pub use error::CryptoError;
 pub use invitation::{Invitation, MAX_LINK_LEN, claim_hash};
