@@ -280,7 +280,7 @@ impl Store {
         Ok(record)
     }
 
-    /// Revokes a pair and deletes its queued messages. Either member.
+    /// Revokes a pair and deletes its queued messages and artifacts. Either member.
     /// Repeating it is a no-op.
     ///
     /// # Errors
@@ -296,10 +296,12 @@ impl Store {
             return Ok(locked.record);
         }
         let record = transition(&mut tx, &locked.record, PairState::Revoked, None, None).await?;
-        sqlx::query("DELETE FROM lanes WHERE pair_id = $1")
-            .bind(pg_uuid(pair.as_bytes()))
-            .execute(&mut *tx)
-            .await?;
+        for table in ["lanes", "artifacts"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE pair_id = $1"))
+                .bind(pg_uuid(pair.as_bytes()))
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(record)
     }

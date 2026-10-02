@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::bytes::{Blob, FixedBytes};
-use crate::id::{DeviceId, MessageId, PairId};
+use crate::id::{ArtifactId, DeviceId, MessageId, PairId};
 use crate::pair_state::PairState;
 use crate::wire_enum;
 
@@ -147,6 +147,38 @@ pub enum ClientFrame {
         /// Last saved position.
         position: Position,
     },
+    /// Upload one chunk of a sealed artifact. Chunks go in order; a repeated
+    /// chunk is ignored, so an upload resumes from `artifact_stored`.
+    ArtifactPut {
+        /// Pair ID.
+        pair: PairId,
+        /// Artifact ID.
+        artifact: ArtifactId,
+        /// Total sealed size.
+        total: u64,
+        /// SHA-256 of all sealed bytes. Checked when the upload completes.
+        hash: FixedBytes<32>,
+        /// Byte offset of this chunk.
+        offset: u64,
+        /// Sealed bytes.
+        chunk: Blob,
+    },
+    /// Download the stored chunk that starts at `offset`.
+    ArtifactGet {
+        /// Pair ID.
+        pair: PairId,
+        /// Artifact ID.
+        artifact: ArtifactId,
+        /// Chunk start.
+        offset: u64,
+    },
+    /// Delete an artifact. Either device. Repeating it is a no-op.
+    ArtifactDelete {
+        /// Pair ID.
+        pair: PairId,
+        /// Artifact ID.
+        artifact: ArtifactId,
+    },
 }
 
 /// Frame from the server to a device.
@@ -210,6 +242,30 @@ pub enum ServerFrame {
         /// Last time the peer was connected.
         last_seen: Option<Timestamp>,
     },
+    /// Upload progress.
+    ArtifactStored {
+        /// Pair ID.
+        pair: PairId,
+        /// Artifact ID.
+        artifact: ArtifactId,
+        /// Contiguous bytes stored.
+        received: u64,
+        /// `true` once all bytes are stored and the hash matched.
+        complete: bool,
+    },
+    /// One stored chunk.
+    ArtifactChunk {
+        /// Pair ID.
+        pair: PairId,
+        /// Artifact ID.
+        artifact: ArtifactId,
+        /// Chunk start.
+        offset: u64,
+        /// Total sealed size.
+        total: u64,
+        /// Sealed bytes.
+        chunk: Blob,
+    },
     /// A request failed.
     Error {
         /// Error code.
@@ -220,6 +276,9 @@ pub enum ServerFrame {
         pair: Option<PairId>,
         /// Related message.
         id: Option<MessageId>,
+        /// Related artifact.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<ArtifactId>,
     },
 }
 
@@ -360,10 +419,24 @@ mod tests {
                 message: "ID reused".to_owned(),
                 pair: Some(pair()),
                 id: None,
+                artifact: None,
             },
             &json!({
                 "type": "error", "code": "conflict", "message": "ID reused",
                 "pair": pair().to_string(), "id": null
+            }),
+        );
+        let artifact = ArtifactId::from_bytes([4; 16]);
+        round_trip(
+            &ServerFrame::ArtifactStored {
+                pair: pair(),
+                artifact,
+                received: 3,
+                complete: false,
+            },
+            &json!({
+                "type": "artifact_stored", "pair": pair().to_string(),
+                "artifact": artifact.to_string(), "received": 3, "complete": false
             }),
         );
     }

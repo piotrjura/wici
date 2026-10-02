@@ -225,3 +225,41 @@ async fn invalid_requests_are_rejected_locally() {
     ));
     a.client.reconnect_now();
 }
+
+#[tokio::test]
+async fn artifacts_upload_share_download_and_delete() {
+    let (mut server, mut a, mut b, pair) = paired_devices().await;
+    let picture: Vec<u8> = (0..300_000_u32).map(|i| (i % 251) as u8).collect();
+    let artifact = a
+        .client
+        .upload(pair, picture.clone(), "image/png", Some("p.png".to_owned()))
+        .await
+        .unwrap();
+    assert_eq!(artifact.size, picture.len() as u64);
+    let shared = Body::Event {
+        stream: StreamId::generate(),
+        data: serde_json::to_value(&artifact).unwrap(),
+    };
+    a.client.send(pair, Lane::Data, &shared).await.unwrap();
+
+    let Body::Event { data, .. } = received(&mut b).await.body else {
+        panic!("not an event")
+    };
+    let reference: wici_protocol::ArtifactRef = serde_json::from_value(data).unwrap();
+    assert_eq!(b.client.download(pair, &reference).await.unwrap(), picture);
+
+    b.client.delete_artifact(pair, reference.id).await.unwrap();
+    let gone = b.client.download(pair, &reference).await;
+    assert!(matches!(
+        gone,
+        Err(ClientError::Server {
+            code: wici_protocol::ErrorCode::NotFound,
+            ..
+        })
+    ));
+
+    server.stop().await;
+    a.expect(|e| *e == Event::Disconnected).await;
+    let offline = a.client.upload(pair, vec![1], "text/plain", None).await;
+    assert!(matches!(offline, Err(ClientError::Offline)));
+}

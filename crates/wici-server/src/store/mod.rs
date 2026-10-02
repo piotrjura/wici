@@ -1,5 +1,6 @@
 //! PostgreSQL storage. Every state change commits before the server replies.
 
+mod artifacts;
 mod messages;
 mod pairs;
 
@@ -15,6 +16,7 @@ use wici_protocol::{
     WireEnum,
 };
 
+pub use artifacts::{ArtifactLimits, ChunkUpload, Progress, StoredChunk};
 pub use messages::{Accepted, Delivery, LaneCursor, LaneKey, NewMessage};
 pub use pairs::Claim;
 

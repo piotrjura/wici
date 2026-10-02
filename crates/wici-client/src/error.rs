@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 
 use wici_crypto::CryptoError;
-use wici_protocol::{BodyError, CommandState};
+use wici_protocol::{BodyError, CommandState, ErrorCode};
 
 /// A client request failed.
 #[derive(Debug)]
@@ -30,6 +30,15 @@ pub enum ClientError {
     TooLarge,
     /// The invitation was created by this device.
     OwnInvitation,
+    /// Not connected, or the connection ended during the request.
+    Offline,
+    /// The server rejected the request.
+    Server {
+        /// Error code.
+        code: ErrorCode,
+        /// Reason.
+        message: String,
+    },
 }
 
 impl fmt::Display for ClientError {
@@ -50,6 +59,8 @@ impl fmt::Display for ClientError {
             Self::Body(error) => write!(f, "invalid body: {error}"),
             Self::TooLarge => f.write_str("message too large"),
             Self::OwnInvitation => f.write_str("cannot join own invitation"),
+            Self::Offline => f.write_str("not connected"),
+            Self::Server { code, message } => write!(f, "server error `{code}`: {message}"),
         }
     }
 }
@@ -65,7 +76,9 @@ impl Error for ClientError {
             | Self::PairState
             | Self::Transition { .. }
             | Self::TooLarge
-            | Self::OwnInvitation => None,
+            | Self::OwnInvitation
+            | Self::Offline
+            | Self::Server { .. } => None,
         }
     }
 }
@@ -101,9 +114,8 @@ pub type ClientResult<T> = Result<T, ClientError>;
 mod tests {
     use super::*;
 
-    #[test]
-    fn messages_name_the_problem() {
-        let cases = [
+    fn cases() -> Vec<(ClientError, &'static str)> {
+        vec![
             (
                 ClientError::Storage(sqlx::Error::PoolClosed),
                 "local storage error",
@@ -135,7 +147,20 @@ mod tests {
             ),
             (ClientError::TooLarge, "message too large"),
             (ClientError::OwnInvitation, "cannot join own invitation"),
-        ];
+            (ClientError::Offline, "not connected"),
+            (
+                ClientError::Server {
+                    code: ErrorCode::NotFound,
+                    message: "gone".to_owned(),
+                },
+                "server error `not_found`: gone",
+            ),
+        ]
+    }
+
+    #[test]
+    fn messages_name_the_problem() {
+        let cases = cases();
         for (error, text) in cases {
             assert_eq!(error.to_string(), text);
             let has_source = matches!(

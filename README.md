@@ -3,7 +3,7 @@
 Rust system that connects paired devices in real time, end-to-end encrypted.
 Commands, streams, approvals, results, and files survive failures.
 
-Status: early. Only the command lifecycle exists. See the [plan](docs/project-plan.md).
+Status: early. Server and Rust client work; see the [plan](docs/project-plan.md).
 
 ## Setup
 

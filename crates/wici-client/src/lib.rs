@@ -18,6 +18,7 @@ mod runtime;
 mod shared;
 #[cfg(test)]
 mod testing;
+mod transfer;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,8 +29,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use wici_crypto::{DeviceKeys, Invitation};
 use wici_protocol::{
-    Body, ClientFrame, CommandState, DeviceId, Lane, Lifecycle, LiveBody, MessageId, PairId,
-    PairState, Position, StreamId, Timestamp,
+    ArtifactId, ArtifactRef, Body, ClientFrame, CommandState, DeviceId, Lane, Lifecycle, LiveBody,
+    MessageId, PairId, PairState, Position, StreamId, Timestamp,
 };
 
 pub use error::{ClientError, ClientResult};
@@ -61,6 +62,10 @@ pub struct ClientConfig {
     pub connect_timeout: Duration,
     /// Events buffered for the app.
     pub event_buffer: usize,
+    /// Largest artifact this client uploads.
+    pub max_artifact_bytes: u64,
+    /// Time to wait for a server answer to an artifact request.
+    pub request_timeout: Duration,
 }
 
 impl ClientConfig {
@@ -78,6 +83,8 @@ impl ClientConfig {
             idle: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(10),
             event_buffer: 256,
+            max_artifact_bytes: 64 * 1024 * 1024,
+            request_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -128,9 +135,15 @@ impl Client {
         let db = Db::open(&config.database).await?;
         let (events, receiver) = mpsc::channel(config.event_buffer.max(1));
         let (live, live_rx) = mpsc::channel(config.event_buffer.max(1));
-        let shared = Arc::new(Shared::new(db, keys, config, events, live));
+        let (requests, requests_rx) = mpsc::channel(16);
+        let channels = shared::Channels {
+            events,
+            live,
+            requests,
+        };
+        let shared = Arc::new(Shared::new(db, keys, config, channels));
         recover(&shared).await?;
-        let task = tokio::spawn(runtime::run(Arc::clone(&shared), live_rx));
+        let task = tokio::spawn(runtime::run(Arc::clone(&shared), live_rx, requests_rx));
         Ok((
             Self {
                 shared,
@@ -366,6 +379,43 @@ impl Client {
             .live
             .try_send(ClientFrame::Live { pair, sealed });
         Ok(())
+    }
+
+    /// Encrypts and uploads a file for the pair. Send the returned reference
+    /// to the peer in a durable message. Requires a connection.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Offline`] if the connection is down or drops (call
+    /// again to resume), [`ClientError::TooLarge`], [`ClientError::Server`].
+    pub async fn upload(
+        &self,
+        pair: PairId,
+        data: Vec<u8>,
+        media_type: &str,
+        name: Option<String>,
+    ) -> ClientResult<ArtifactRef> {
+        transfer::upload(&self.shared, pair, data, media_type, name).await
+    }
+
+    /// Downloads and decrypts an artifact the peer uploaded. Checks its hash.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Offline`], [`ClientError::Server`] (for example
+    /// `not_found` after deletion), [`ClientError::Corrupt`] or
+    /// [`ClientError::Crypto`] for altered data.
+    pub async fn download(&self, pair: PairId, artifact: &ArtifactRef) -> ClientResult<Vec<u8>> {
+        transfer::download(&self.shared, pair, artifact).await
+    }
+
+    /// Deletes an artifact on the server. Either device can.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Offline`] if the client stopped.
+    pub async fn delete_artifact(&self, pair: PairId, artifact: ArtifactId) -> ClientResult<()> {
+        transfer::delete(&self.shared, pair, artifact).await
     }
 
     /// Received messages not yet marked handled, oldest first. Call after a

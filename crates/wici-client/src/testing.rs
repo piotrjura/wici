@@ -35,8 +35,14 @@ pub(crate) async fn fixture(state: PairState) -> Fixture {
     let peer = invitation.join(&peer_device).unwrap();
     let (events, receiver) = mpsc::channel(64);
     let (live, _) = mpsc::channel(1);
+    let (requests, _) = mpsc::channel(1);
     let config = ClientConfig::new("ws://unused", dir.path().join("client.db"));
-    let shared = Arc::new(Shared::new(db, keys, config, events, live));
+    let channels = crate::shared::Channels {
+        events,
+        live,
+        requests,
+    };
+    let shared = Arc::new(Shared::new(db, keys, config, channels));
     let row = PairRow {
         id: invitation.pair,
         role: Role::Inviter,

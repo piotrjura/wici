@@ -491,3 +491,92 @@ async fn health_check_and_graceful_shutdown() {
     server.stop().await;
     assert_eq!(a.recv().await, None);
 }
+
+/// Uploads `data` in one chunk and waits until it is complete.
+async fn upload(
+    client: &mut Client,
+    pair: wici_protocol::PairId,
+    key: &wici_crypto::ArtifactKey,
+    data: &[u8],
+) {
+    let sealed = key.seal_all(data).unwrap();
+    let total = sealed.len() as u64;
+    let hash = wici_crypto::artifact_hash(&sealed);
+    let chunk = Blob::new(sealed);
+    client
+        .send(&ClientFrame::ArtifactPut {
+            pair,
+            artifact: key.id(),
+            total,
+            hash,
+            offset: 0,
+            chunk,
+        })
+        .await;
+    let stored = client
+        .recv_where(|f| matches!(f, ServerFrame::ArtifactStored { .. }))
+        .await;
+    assert!(
+        matches!(stored, ServerFrame::ArtifactStored { complete: true, received, .. } if received == total)
+    );
+}
+
+#[tokio::test]
+async fn artifact_upload_and_download_over_websocket() {
+    let server = Server::start().await;
+    let Paired {
+        mut a, mut b, pair, ..
+    } = paired(&server).await;
+    let key = wici_crypto::ArtifactKey::generate();
+    upload(&mut a, pair, &key, b"picture").await;
+
+    b.send(&ClientFrame::ArtifactGet {
+        pair,
+        artifact: key.id(),
+        offset: 0,
+    })
+    .await;
+    let ServerFrame::ArtifactChunk { chunk, .. } = b
+        .recv_where(|f| matches!(f, ServerFrame::ArtifactChunk { .. }))
+        .await
+    else {
+        panic!("unexpected frame")
+    };
+    assert_eq!(*key.open_all(chunk.as_bytes()).unwrap(), b"picture");
+
+    b.send(&ClientFrame::ArtifactDelete {
+        pair,
+        artifact: key.id(),
+    })
+    .await;
+    b.send(&ClientFrame::ArtifactGet {
+        pair,
+        artifact: key.id(),
+        offset: 0,
+    })
+    .await;
+    let error = b.recv_where(|f| error_code(f).is_some()).await;
+    let gone = |id: &Option<wici_protocol::ArtifactId>| *id == Some(key.id());
+    assert!(
+        matches!(error, ServerFrame::Error { code: ErrorCode::NotFound, ref artifact, .. } if gone(artifact))
+    );
+}
+
+#[tokio::test]
+async fn oversized_artifact_chunk_is_rejected() {
+    let server = Server::with(|c| c.limits.max_chunk_bytes = 4).await;
+    let Paired { mut a, pair, .. } = paired(&server).await;
+    a.send(&ClientFrame::ArtifactPut {
+        pair,
+        artifact: wici_protocol::ArtifactId::generate(),
+        total: 10,
+        hash: wici_protocol::FixedBytes::new([0; 32]),
+        offset: 0,
+        chunk: Blob::new(vec![0; 5]),
+    })
+    .await;
+    assert_eq!(
+        error_code(&a.recv_no_presence().await),
+        Some(ErrorCode::LimitExceeded)
+    );
+}

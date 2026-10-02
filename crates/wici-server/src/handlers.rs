@@ -6,14 +6,14 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use wici_protocol::{
-    Blob, ClientFrame, DeviceId, ErrorCode, FixedBytes, Lane, MessageId, PairId, PairState,
-    Position, ServerFrame,
+    ArtifactId, Blob, ClientFrame, DeviceId, ErrorCode, FixedBytes, Lane, MessageId, PairId,
+    PairState, Position, ServerFrame,
 };
 
 use crate::App;
 use crate::hub::Peer;
 use crate::rate::RateLimit;
-use crate::store::{Claim, LaneKey, NewMessage, PairRecord, StoreError};
+use crate::store::{ChunkUpload, Claim, LaneKey, NewMessage, PairRecord, StoreError};
 
 /// A request failed. Sent to the device as an `error` frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +22,7 @@ pub(crate) struct Failure {
     message: String,
     pair: Option<PairId>,
     id: Option<MessageId>,
+    artifact: Option<ArtifactId>,
 }
 
 impl Failure {
@@ -31,6 +32,7 @@ impl Failure {
             message: message.to_owned(),
             pair: None,
             id: None,
+            artifact: None,
         }
     }
 
@@ -46,12 +48,19 @@ impl Failure {
         self
     }
 
+    const fn about_artifact(mut self, pair: PairId, artifact: ArtifactId) -> Self {
+        self.pair = Some(pair);
+        self.artifact = Some(artifact);
+        self
+    }
+
     pub(crate) fn into_frame(self) -> ServerFrame {
         ServerFrame::Error {
             code: self.code,
             message: self.message,
             pair: self.pair,
             id: self.id,
+            artifact: self.artifact,
         }
     }
 }
@@ -142,6 +151,7 @@ impl Connection {
     }
 
     /// Handles one frame.
+    #[expect(clippy::too_many_lines, reason = "one short arm per frame type")]
     pub(crate) async fn handle(&mut self, frame: ClientFrame) -> Handled {
         if !self.rate.allow(Instant::now()) {
             return Err(Failure::new(ErrorCode::RateLimited, "too many frames"));
@@ -176,6 +186,37 @@ impl Connection {
                 lane,
                 position,
             } => self.ack(pair, lane, position).await,
+            ClientFrame::ArtifactPut {
+                pair,
+                artifact,
+                total,
+                hash,
+                offset,
+                chunk,
+            } => {
+                let upload = ChunkUpload {
+                    pair,
+                    artifact,
+                    total,
+                    hash: &hash,
+                    offset,
+                    data: &chunk,
+                };
+                self.put_chunk(&upload).await
+            }
+            ClientFrame::ArtifactGet {
+                pair,
+                artifact,
+                offset,
+            } => self.get_chunk(pair, artifact, offset).await,
+            ClientFrame::ArtifactDelete { pair, artifact } => {
+                let deleted = self
+                    .app
+                    .store
+                    .delete_artifact(&self.device, pair, artifact)
+                    .await;
+                deleted.map_err(|e| Failure::from(e).about_artifact(pair, artifact))
+            }
         }
     }
 
@@ -281,6 +322,52 @@ impl Connection {
     }
 }
 
+impl Connection {
+    async fn put_chunk(&self, upload: &ChunkUpload<'_>) -> Handled {
+        let about = |failure: Failure| failure.about_artifact(upload.pair, upload.artifact);
+        if upload.data.len() > self.app.config.limits.max_chunk_bytes {
+            return Err(about(Failure::new(
+                ErrorCode::LimitExceeded,
+                "chunk too large",
+            )));
+        }
+        let limits = self.app.config.limits.artifacts;
+        let progress = self
+            .app
+            .store
+            .put_chunk(&self.device, upload, limits)
+            .await
+            .map_err(|e| about(e.into()))?;
+        self.peer.send_control(ServerFrame::ArtifactStored {
+            pair: upload.pair,
+            artifact: upload.artifact,
+            received: progress.received,
+            complete: progress.complete,
+        });
+        Ok(())
+    }
+
+    async fn get_chunk(&self, pair: PairId, artifact: ArtifactId, offset: u64) -> Handled {
+        let chunk = self
+            .app
+            .store
+            .get_chunk(&self.device, pair, artifact, offset)
+            .await
+            .map_err(|e| Failure::from(e).about_artifact(pair, artifact))?;
+        let frame = ServerFrame::ArtifactChunk {
+            pair,
+            artifact,
+            offset: chunk.offset,
+            total: chunk.total,
+            chunk: chunk.data,
+        };
+        // Waits while the data queue is full: the reader slows down instead
+        // of buffering without bound.
+        let _ = self.peer.outbox.data.send(frame).await;
+        Ok(())
+    }
+}
+
 fn active_peers(device: &DeviceId, pairs: &[PairRecord]) -> HashMap<PairId, DeviceId> {
     pairs
         .iter()
@@ -355,6 +442,7 @@ mod tests {
                 message: "reused: x".to_owned(),
                 pair: Some(pair),
                 id: Some(id),
+                artifact: None,
             }
         );
     }

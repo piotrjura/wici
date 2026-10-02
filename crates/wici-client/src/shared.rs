@@ -1,6 +1,7 @@
 //! State shared by the client handle and its connection task.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::{Notify, mpsc};
@@ -13,6 +14,7 @@ use crate::ClientConfig;
 use crate::db::{Db, InboxRow, OutboxRow, PairRow};
 use crate::error::{ClientError, ClientResult};
 use crate::model::{Event, PairView};
+use crate::transfer::Request;
 
 pub(crate) struct Shared {
     pub(crate) db: Db,
@@ -26,7 +28,18 @@ pub(crate) struct Shared {
     pub(crate) stop: CancellationToken,
     events: mpsc::Sender<Event>,
     pub(crate) live: mpsc::Sender<ClientFrame>,
+    /// Artifact requests for the connection task.
+    pub(crate) requests: mpsc::Sender<Request>,
+    /// `true` while authenticated to the server.
+    pub(crate) connected: AtomicBool,
     cache: Mutex<HashMap<PairId, Arc<PairKeys>>>,
+}
+
+/// Channels from the client to the app and the connection task.
+pub(crate) struct Channels {
+    pub(crate) events: mpsc::Sender<Event>,
+    pub(crate) live: mpsc::Sender<ClientFrame>,
+    pub(crate) requests: mpsc::Sender<Request>,
 }
 
 fn context(pair: PairId, what: &str) -> Vec<u8> {
@@ -34,13 +47,7 @@ fn context(pair: PairId, what: &str) -> Vec<u8> {
 }
 
 impl Shared {
-    pub(crate) fn new(
-        db: Db,
-        keys: DeviceKeys,
-        config: ClientConfig,
-        events: mpsc::Sender<Event>,
-        live: mpsc::Sender<ClientFrame>,
-    ) -> Self {
+    pub(crate) fn new(db: Db, keys: DeviceKeys, config: ClientConfig, channels: Channels) -> Self {
         Self {
             vault: keys.local_vault(),
             db,
@@ -49,8 +56,10 @@ impl Shared {
             wake: Notify::new(),
             reconnect: Notify::new(),
             stop: CancellationToken::new(),
-            events,
-            live,
+            events: channels.events,
+            live: channels.live,
+            requests: channels.requests,
+            connected: AtomicBool::new(false),
             cache: Mutex::new(HashMap::new()),
         }
     }

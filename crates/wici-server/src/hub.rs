@@ -133,6 +133,7 @@ mod tests {
             message: String::new(),
             pair: Some(PairId::generate()),
             id: None,
+            artifact: None,
         }
     }
 

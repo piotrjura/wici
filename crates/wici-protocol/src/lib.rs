@@ -9,7 +9,7 @@ mod lifecycle;
 mod pair_state;
 pub mod wire;
 
-pub use body::{Body, BodyError, LiveBody, MAX_OPERATION_LEN};
+pub use body::{ArtifactRef, Body, BodyError, LiveBody, MAX_OPERATION_LEN};
 pub use bytes::{Blob, BytesError, FixedBytes};
 pub use command_state::CommandState;
 pub use frame::{

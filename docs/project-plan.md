@@ -1,6 +1,7 @@
 # Wici plan
 
-Status: early. Only the command lifecycle (`wici-protocol`) exists.
+Status: protocol, crypto, server, client, and artifacts exist and are tested.
+Push hints and the Swift package are planned.
 
 ## Goal
 

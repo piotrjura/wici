@@ -6,9 +6,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::bytes::FixedBytes;
 use crate::command_state::CommandState;
 use crate::frame::Timestamp;
-use crate::id::{MessageId, StreamId};
+use crate::id::{ArtifactId, MessageId, StreamId};
 
 /// Maximum operation name length in bytes.
 pub const MAX_OPERATION_LEN: usize = 128;
@@ -67,6 +68,26 @@ pub enum Body {
         /// App-defined data.
         data: Value,
     },
+}
+
+/// Describes an uploaded artifact. Put it in a sealed body (for example
+/// in `Event::data`) so only the peer learns the key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactRef {
+    /// Artifact ID.
+    pub id: ArtifactId,
+    /// Artifact key.
+    pub key: FixedBytes<32>,
+    /// Plaintext size.
+    pub size: u64,
+    /// Sealed size stored on the server.
+    pub sealed_size: u64,
+    /// SHA-256 of the sealed bytes.
+    pub hash: FixedBytes<32>,
+    /// Media type, for example `image/png`.
+    pub media_type: String,
+    /// File name, if any.
+    pub name: Option<String>,
 }
 
 /// Body of a live (non-durable) update.

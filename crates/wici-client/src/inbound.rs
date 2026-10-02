@@ -30,6 +30,7 @@ pub(crate) fn advance(current: Option<CommandState>, next: CommandState) -> Opti
 }
 
 /// Handles one frame. Returns a frame to send back, if any.
+#[expect(clippy::too_many_lines, reason = "one short arm per frame type")]
 pub(crate) async fn handle(
     shared: &Shared,
     frame: ServerFrame,
@@ -77,10 +78,14 @@ pub(crate) async fn handle(
             message,
             pair,
             id,
+            ..
         } => {
             on_error(shared, code, message, (pair, id), flight).await?;
         }
-        ServerFrame::Challenge { .. } | ServerFrame::Welcome { .. } => {}
+        ServerFrame::Challenge { .. }
+        | ServerFrame::Welcome { .. }
+        | ServerFrame::ArtifactStored { .. }
+        | ServerFrame::ArtifactChunk { .. } => {}
     }
     Ok(None)
 }
@@ -745,6 +750,7 @@ mod tests {
             message: "x".to_owned(),
             pair: Some(pair),
             id: Some(id),
+            artifact: None,
         };
         run(&f, error(ErrorCode::RateLimited, ids[0])).await;
         assert_eq!(f.event(), None, "transient errors retry quietly");
@@ -770,6 +776,7 @@ mod tests {
                 message: String::new(),
                 pair: None,
                 id: None,
+                artifact: None,
             },
         )
         .await;
@@ -901,6 +908,7 @@ mod tests {
             message: String::new(),
             pair: Some(pair),
             id: None,
+            artifact: None,
         };
         let mut flight = InFlight::default();
         handle(&f.shared, error(ErrorCode::Internal), &mut flight)
@@ -938,6 +946,7 @@ mod tests {
             message: String::new(),
             pair: Some(pair),
             id: None,
+            artifact: None,
         };
         run(&f, error).await;
         assert_eq!(f.pair_row().await.pending, None);

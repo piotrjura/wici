@@ -78,17 +78,36 @@ async fn upgrade(State(app): State<Arc<App>>, upgrade: WebSocketUpgrade) -> Resp
         .on_upgrade(move |socket| session::run(socket, app))
 }
 
-/// Expires overdue invitations and claims and tells their members.
+/// Runs [`sweep_once`] on an interval until shutdown.
 async fn sweep(app: Arc<App>) {
     let mut ticker = tokio::time::interval(app.config.timeouts.sweep);
     loop {
         tokio::select! {
             () = app.shutdown.cancelled() => return,
-            _ = ticker.tick() => {}
-        }
-        match app.store.expire_due(100).await {
-            Ok(expired) => expired.iter().for_each(|record| app.notify_pair(record)),
-            Err(error) => tracing::warn!(%error, "expiry sweep failed"),
+            _ = ticker.tick() => sweep_once(&app).await,
         }
     }
+}
+
+/// Expires overdue invitations, claims, and artifacts. Tells pair members.
+async fn sweep_once(app: &App) {
+    if let Some(expired) = logged(app.store.expire_due(100).await, "expiry sweep failed") {
+        for record in &expired {
+            app.notify_pair(record);
+        }
+    }
+    let timeouts = app.config.timeouts;
+    let old = app.store.expire_artifacts(
+        timeouts.artifact_incomplete,
+        timeouts.artifact_complete,
+        100,
+    );
+    logged(old.await, "artifact sweep failed");
+}
+
+/// Logs a failed background step and continues.
+fn logged<T>(result: store::StoreResult<T>, what: &'static str) -> Option<T> {
+    result
+        .map_err(|error| tracing::warn!(%error, "{what}"))
+        .ok()
 }

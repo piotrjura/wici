@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::store::StoreLimits;
+use crate::store::{ArtifactLimits, StoreLimits};
 
 /// Size, rate, and queue limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +16,10 @@ pub struct Limits {
     pub max_live_bytes: usize,
     /// Largest pairing greeting.
     pub max_greeting_bytes: usize,
+    /// Largest artifact chunk.
+    pub max_chunk_bytes: usize,
+    /// Artifact limits.
+    pub artifacts: ArtifactLimits,
     /// Unacknowledged deliveries in flight per lane.
     pub delivery_window: u64,
     /// Messages read from storage per query.
@@ -39,6 +43,11 @@ impl Default for Limits {
             max_sealed_bytes: 1024 * 1024,
             max_live_bytes: 64 * 1024,
             max_greeting_bytes: 4096,
+            max_chunk_bytes: 256 * 1024,
+            artifacts: ArtifactLimits {
+                max_bytes: 64 * 1024 * 1024,
+                max_incomplete: 16,
+            },
             delivery_window: 128,
             fetch_batch: 64,
             control_queue: 256,
@@ -68,6 +77,10 @@ pub struct Timeouts {
     pub claim: Duration,
     /// Interval of the expiry sweep.
     pub sweep: Duration,
+    /// Unfinished uploads are deleted after this.
+    pub artifact_incomplete: Duration,
+    /// Finished artifacts are deleted after this.
+    pub artifact_complete: Duration,
 }
 
 impl Default for Timeouts {
@@ -79,6 +92,8 @@ impl Default for Timeouts {
             invite: Duration::from_secs(120),
             claim: Duration::from_secs(600),
             sweep: Duration::from_secs(5),
+            artifact_incomplete: Duration::from_secs(24 * 3600),
+            artifact_complete: Duration::from_secs(7 * 24 * 3600),
         }
     }
 }
@@ -184,6 +199,10 @@ mod tests {
         let limits = Limits::default();
         assert!(limits.max_sealed_bytes < limits.max_frame_bytes);
         assert!(limits.fetch_batch <= limits.delivery_window);
+        assert!(
+            limits.max_chunk_bytes < limits.max_frame_bytes / 2,
+            "base64 fits"
+        );
         let timeouts = Timeouts::default();
         assert!(timeouts.ping < timeouts.idle);
     }

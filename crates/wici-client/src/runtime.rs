@@ -1,6 +1,7 @@
 //! Connection task: connect, authenticate, exchange frames, reconnect.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -16,6 +17,7 @@ use crate::inbound;
 use crate::model::Event;
 use crate::outbound::{self, InFlight};
 use crate::shared::Shared;
+use crate::transfer::{Request, Waiters};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Socket, Message>;
@@ -29,14 +31,23 @@ const MAX_FRAME: usize = 4 * 1024 * 1024;
 struct Closed;
 
 /// Runs until the client stops.
-pub(crate) async fn run(shared: Arc<Shared>, mut live: mpsc::Receiver<ClientFrame>) {
+pub(crate) async fn run(
+    shared: Arc<Shared>,
+    live: mpsc::Receiver<ClientFrame>,
+    requests: mpsc::Receiver<Request>,
+) {
+    let mut inputs = Inputs { live, requests };
     let config = &shared.config;
     let mut backoff = Backoff::new(config.reconnect_min, config.reconnect_max);
     while !shared.stop.is_cancelled() {
         if let Ok((socket, pairs)) = connect(&shared).await {
             backoff.reset();
+            shared.connected.store(true, Ordering::Release);
             shared.emit(Event::Connected).await;
-            session(&shared, socket, &pairs, &mut live).await;
+            session(&shared, socket, &pairs, &mut inputs).await;
+            shared.connected.store(false, Ordering::Release);
+            // Requests that missed the connection fail now, not on timeout.
+            while inputs.requests.try_recv().is_ok() {}
             shared.emit(Event::Disconnected).await;
         }
         tokio::select! {
@@ -104,24 +115,34 @@ where
         .map_err(|_| Closed)
 }
 
+/// Frames the app asks the connection task to send.
+pub(crate) struct Inputs {
+    live: mpsc::Receiver<ClientFrame>,
+    requests: mpsc::Receiver<Request>,
+}
+
+/// Per-connection state. Dropped on disconnect, which fails open requests.
+#[derive(Default)]
+struct Connection {
+    flight: InFlight,
+    waiters: Waiters,
+}
+
 /// Exchanges frames until the connection ends.
-async fn session(
-    shared: &Shared,
-    socket: Socket,
-    pairs: &[PairInfo],
-    live: &mut mpsc::Receiver<ClientFrame>,
-) {
+async fn session(shared: &Shared, socket: Socket, pairs: &[PairInfo], inputs: &mut Inputs) {
     let (mut sink, mut stream) = socket.split();
-    let mut flight = InFlight::default();
+    let mut connection = Connection::default();
     for info in pairs {
-        if let Err(error) = inbound::on_pair(shared, info, &mut flight).await {
+        if let Err(error) = inbound::on_pair(shared, info, &mut connection.flight).await {
             tracing::warn!(%error, "cannot apply pair");
         }
     }
-    if flush(shared, &mut sink, &mut flight).await.is_err() {
-        return;
+    if flush(shared, &mut sink, &mut connection.flight)
+        .await
+        .is_ok()
+    {
+        let _ = exchange(shared, &mut sink, &mut stream, &mut connection, inputs).await;
     }
-    let _ = exchange(shared, &mut sink, &mut stream, &mut flight, live).await;
     let _ = sink.close().await;
 }
 
@@ -129,8 +150,8 @@ async fn exchange(
     shared: &Shared,
     sink: &mut Sink,
     stream: &mut Stream,
-    flight: &mut InFlight,
-    live: &mut mpsc::Receiver<ClientFrame>,
+    connection: &mut Connection,
+    inputs: &mut Inputs,
 ) -> Result<(), Closed> {
     let mut retry = tokio::time::interval(shared.config.retry_interval);
     loop {
@@ -138,13 +159,17 @@ async fn exchange(
             () = shared.stop.cancelled() => return Ok(()),
             frame = tokio::time::timeout(shared.config.idle, read(stream)) => {
                 let frame = frame.map_err(|_| Closed)?.ok_or(Closed)?;
-                receive(shared, sink, frame, flight).await?;
+                receive(shared, sink, frame, connection).await?;
             }
-            () = shared.wake.notified() => flush(shared, sink, flight).await?,
-            Some(frame) = live.recv() => write(sink, &frame).await?,
+            () = shared.wake.notified() => flush(shared, sink, &mut connection.flight).await?,
+            Some(frame) = inputs.live.recv() => write(sink, &frame).await?,
+            Some(request) = inputs.requests.recv() => {
+                write(sink, &request.frame).await?;
+                connection.waiters.insert(request.artifact, request.reply);
+            }
             _ = retry.tick() => {
-                flight.retry();
-                flush(shared, sink, flight).await?;
+                connection.flight.retry();
+                flush(shared, sink, &mut connection.flight).await?;
             }
         }
     }
@@ -154,9 +179,12 @@ async fn receive(
     shared: &Shared,
     sink: &mut Sink,
     frame: ServerFrame,
-    flight: &mut InFlight,
+    connection: &mut Connection,
 ) -> Result<(), Closed> {
-    match inbound::handle(shared, frame, flight).await {
+    let Some(frame) = connection.waiters.route(frame) else {
+        return Ok(());
+    };
+    match inbound::handle(shared, frame, &mut connection.flight).await {
         Ok(Some(reply)) => write(sink, &reply).await,
         Ok(None) => Ok(()),
         Err(error) => {
