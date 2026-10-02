@@ -1,6 +1,7 @@
 //! Wici cryptography: device keys, pairing, and sealing.
 //!
 //! Only reviewed primitives: Ed25519, X25519, HKDF-SHA256, ChaCha20-Poly1305.
+//! Local records are sealed with [`LocalVault`].
 //!
 //! ```
 //! use wici_crypto::{DeviceKeys, Invitation};
@@ -25,8 +26,10 @@ mod error;
 mod invitation;
 mod kdf;
 mod pair;
+mod vault;
 
 pub use device::{DeviceKeys, verify_challenge};
 pub use error::CryptoError;
 pub use invitation::{Invitation, MAX_LINK_LEN, claim_hash};
 pub use pair::PairKeys;
+pub use vault::LocalVault;
