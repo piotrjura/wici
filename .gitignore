@@ -1,0 +1,13 @@
+# Rust build output
+/target/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Local secrets
+.env
+.env.*
+*.pem
+*.key
