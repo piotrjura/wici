@@ -1,8 +1,9 @@
-//! Wire types and command lifecycle rules of the Wici protocol.
-//!
-//! This crate has no storage, network, or runtime dependencies. Other Wici
-//! crates use it as the shared definition of protocol semantics.
+//! Wici protocol: wire types and lifecycles. No I/O.
 
 mod command_state;
+mod lifecycle;
+pub mod wire;
 
-pub use command_state::{CommandState, ParseCommandStateError, TransitionError};
+pub use command_state::CommandState;
+pub use lifecycle::{Lifecycle, TransitionError};
+pub use wire::{ParseWireError, WireEnum};
