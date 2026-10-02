@@ -93,3 +93,18 @@ jobs:
         with:
           node-version: 22
       - run: npx --yes jscpd@4 --config .jscpd.json
+
+  swift:
+    name: Swift package
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install PostgreSQL and Rust targets
+        run: |
+          brew install postgresql@16
+          echo "$(brew --prefix postgresql@16)/bin" >> "$GITHUB_PATH"
+          rustup target add x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
+      - run: scripts/build-xcframework.sh --all
+      - run: cargo build -p wici-server --locked
+      - run: scripts/with-postgres.sh scripts/swift-e2e.sh

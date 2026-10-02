@@ -77,6 +77,8 @@ Run before every commit (CI runs the same, plus macOS and MSRV):
 scripts/verify.sh
 ```
 
+After Swift or FFI changes, also run `scripts/verify-swift.sh`.
+
 ## Commits
 
 - Small, working steps that pass `scripts/verify.sh`.

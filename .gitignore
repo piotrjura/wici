@@ -15,3 +15,7 @@ lcov.info
 .env.*
 *.pem
 *.key
+
+# Swift build output
+/swift/build/
+/swift/.build/

@@ -1,10 +1,19 @@
 {
-  "path": ["crates"],
-  "format": ["rust"],
+  "path": [
+    "crates",
+    "swift/Sources",
+    "swift/Tests"
+  ],
+  "format": [
+    "rust",
+    "swift"
+  ],
   "minLines": 5,
   "minTokens": 50,
   "threshold": 0,
-  "reporters": ["console"],
+  "reporters": [
+    "console"
+  ],
   "gitignore": true,
   "absolute": false
 }
