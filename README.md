@@ -1,8 +1,7 @@
 # Wici
 
-Rust system that connects apps to AI agents on other machines. Delivers
-commands, events, approvals, and results, and survives network and process
-failures without losing accepted work.
+Rust system that connects paired devices in real time, end-to-end encrypted.
+Commands, streams, approvals, results, and files survive failures.
 
 Status: early. Only the command lifecycle exists. See the [plan](docs/project-plan.md).
 

@@ -1,7 +1,7 @@
 # Wici rules
 
-Wici connects apps to AI agents on other machines: commands, events, approvals,
-results. Read [the plan](docs/project-plan.md) before changing behavior. Never
+Wici connects paired devices: commands, streams, approvals, results, files.
+Read [the plan](docs/project-plan.md) before changing behavior. Never
 call planned work done.
 
 ## Writing
@@ -62,7 +62,7 @@ No code without tests, in the same commit.
 ## Reliability
 
 - Persist before acknowledging.
-- Retry with the original ID. Deduplicate by tenant, operation, and payload.
+- Retry with the original ID. Deduplicate by pair, sender, ID, and payload.
 - After restart, reconcile from durable state.
 - Record uncertain outcomes. Never repeat an effect because a reply was lost.
 - Self-repair is bounded and non-destructive. Never erase data, reset
