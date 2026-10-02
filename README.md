@@ -25,6 +25,17 @@ scripts/verify.sh
 Format, Clippy, tests, docs, audit, coverage ≥ 90%, duplicates. Same as CI.
 `scripts/verify-swift.sh` builds the XCFramework and runs the Swift tests.
 
+## Load test
+
+```sh
+scripts/load.sh --users 2500 --active 250 --seconds 120
+```
+
+Runs a release server on a temporary PostgreSQL. Simulated Mac and phone
+pairs send notice, request, and 8 KB snapshot messages. Reports latencies
+and server and database CPU and memory. Fails on lost messages, errors, or
+dropped connections. `--help` lists the options.
+
 ## Use from Swift
 
 `swift/` is the `WiciKit` package. Build `swift/build/WiciFFI.xcframework`
