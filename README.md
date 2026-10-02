@@ -13,6 +13,9 @@ Status: early. Server and Rust client work; see the [plan](docs/project-plan.md)
 - PostgreSQL binaries (`initdb`, `pg_ctl`) for tests
 - Xcode, for the Swift package
 
+Build and verification scripts find Cargo and Homebrew tools in GUI Git
+clients too. If Node is missing from PATH, they try the nvm default.
+
 ## Verify
 
 ```sh

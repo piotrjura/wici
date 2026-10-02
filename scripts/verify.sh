@@ -3,6 +3,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+source scripts/tool-path.sh
 
 readonly MIN_LINE_COVERAGE=90
 
@@ -17,6 +18,8 @@ step() {
     echo "==> $*"
     "$@"
 }
+
+step scripts/test-tool-path.sh
 
 require cargo-deny "cargo install --locked cargo-deny"
 require cargo-llvm-cov "cargo install --locked cargo-llvm-cov"

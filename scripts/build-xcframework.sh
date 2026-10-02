@@ -4,6 +4,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+source scripts/tool-path.sh
 
 out="swift/build"
 lib="libwici_ffi.a"
