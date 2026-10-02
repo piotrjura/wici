@@ -126,7 +126,8 @@ where
         .map_err(|_| Failure::new(ErrorCode::Unauthenticated, "authentication timed out"))?
 }
 
-/// Reads frames until close, idle timeout, or `stop`.
+/// Reads frames until close, idle timeout, or `stop`. Any message, including
+/// a ping or pong, restarts the idle timer.
 async fn read<St>(connection: &mut Connection, stream: &mut St, app: &App, stop: &CancellationToken)
 where
     St: Stream<Item = Result<Message, axum::Error>> + Unpin,
@@ -136,12 +137,14 @@ where
     loop {
         let next = tokio::select! {
             () = stop.cancelled() => return,
-            next = tokio::time::timeout(idle, next_frame(stream, limit)) => next,
+            next = tokio::time::timeout(idle, stream.next()) => next,
         };
-        let result = match next {
-            Ok(Some(Ok(frame))) => connection.handle(frame).await,
-            Ok(Some(Err(failure))) => Err(failure),
-            Ok(None) | Err(_) => return,
+        let Ok(message) = next else { return };
+        let result = match classify(message, limit) {
+            Incoming::Frame(Ok(frame)) => connection.handle(frame).await,
+            Incoming::Frame(Err(failure)) => Err(failure),
+            Incoming::Keepalive => Ok(()),
+            Incoming::Closed => return,
         };
         if let Err(failure) = result {
             connection.fail(failure);
@@ -149,28 +152,43 @@ where
     }
 }
 
-/// Next client frame. `None` when the connection ends. Pings and pongs are
-/// skipped; any message counts as activity.
+/// What one WebSocket message means to the reader.
+enum Incoming {
+    /// A client frame, or why it is invalid.
+    Frame(Result<ClientFrame, Failure>),
+    /// A ping or pong.
+    Keepalive,
+    /// The connection ended.
+    Closed,
+}
+
+/// Decodes one message from the stream. `None` means the stream ended.
+fn classify(message: Option<Result<Message, axum::Error>>, limit: usize) -> Incoming {
+    match message {
+        Some(Ok(Message::Text(text))) => {
+            Incoming::Frame(decode(text.as_str(), limit).map_err(|error| {
+                Failure::new(ErrorCode::InvalidFrame, "invalid frame").detail(&error.to_string())
+            }))
+        }
+        Some(Ok(Message::Binary(_))) => Incoming::Frame(Err(Failure::new(
+            ErrorCode::InvalidFrame,
+            "binary frames unsupported",
+        ))),
+        Some(Ok(Message::Ping(_) | Message::Pong(_))) => Incoming::Keepalive,
+        Some(Ok(Message::Close(_)) | Err(_)) | None => Incoming::Closed,
+    }
+}
+
+/// Next client frame. `None` when the connection ends. Skips pings and pongs.
 async fn next_frame<St>(stream: &mut St, limit: usize) -> Option<Result<ClientFrame, Failure>>
 where
     St: Stream<Item = Result<Message, axum::Error>> + Unpin,
 {
     loop {
-        match stream.next().await? {
-            Ok(Message::Text(text)) => {
-                return Some(decode(text.as_str(), limit).map_err(|error| {
-                    Failure::new(ErrorCode::InvalidFrame, "invalid frame")
-                        .detail(&error.to_string())
-                }));
-            }
-            Ok(Message::Binary(_)) => {
-                return Some(Err(Failure::new(
-                    ErrorCode::InvalidFrame,
-                    "binary frames unsupported",
-                )));
-            }
-            Ok(Message::Ping(_) | Message::Pong(_)) => {}
-            Ok(Message::Close(_)) | Err(_) => return None,
+        match classify(stream.next().await, limit) {
+            Incoming::Frame(frame) => return Some(frame),
+            Incoming::Keepalive => {}
+            Incoming::Closed => return None,
         }
     }
 }
