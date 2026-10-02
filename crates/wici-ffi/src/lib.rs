@@ -1,7 +1,7 @@
 //! C ABI for the Wici client. See `include/wici.h` for the C declarations.
 //!
 //! Requests and events are JSON strings. Each client owns a small Tokio
-//! runtime; callbacks run on its threads, never on the caller's thread.
+//! runtime. Callbacks may also run on the calling or closing thread.
 //! No Rust panic crosses this boundary: every entry point catches it.
 #![expect(
     unsafe_code,
@@ -14,11 +14,12 @@ mod rpc;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
+use tokio::task::{JoinHandle, JoinSet};
 use wici_client::Client;
 use wici_crypto::DeviceKeys;
 
@@ -45,10 +46,37 @@ impl Callback {
     }
 }
 
+/// Resolves even an unpolled or aborted request exactly once.
+struct Reply(Option<Callback>);
+
+impl Reply {
+    fn finish(mut self, value: &Value) {
+        if let Some(callback) = self.0.take() {
+            callback.call(value);
+        }
+    }
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        if let Some(callback) = self.0.take() {
+            callback.call(
+                &rpc::Failure::new(
+                    "outcome_unknown",
+                    "call interrupted; reconcile durable state before retrying",
+                )
+                .to_json(),
+            );
+        }
+    }
+}
+
 /// A running client. Opaque to C.
 pub struct WiciClient {
     runtime: Runtime,
     client: Arc<Client>,
+    calls: Mutex<JoinSet<()>>,
+    events: JoinHandle<()>,
 }
 
 impl std::fmt::Debug for WiciClient {
@@ -137,7 +165,7 @@ fn open(config: &str, secret: &[u8; 64], on_event: Callback) -> Result<WiciClien
     let (client, mut events) = runtime
         .block_on(Client::open(config, keys))
         .map_err(|e| e.to_string())?;
-    runtime.spawn(async move {
+    let events = runtime.spawn(async move {
         while let Some(event) = events.recv().await {
             on_event.call(&serde_json::to_value(&event).unwrap_or(Value::Null));
         }
@@ -145,6 +173,8 @@ fn open(config: &str, secret: &[u8; 64], on_event: Callback) -> Result<WiciClien
     Ok(WiciClient {
         runtime,
         client: Arc::new(client),
+        calls: Mutex::new(JoinSet::new()),
+        events,
     })
 }
 
@@ -192,14 +222,18 @@ pub unsafe extern "C" fn wici_client_open(
     }
 }
 
-/// Runs a JSON request (see `rpc.rs`). `done` is called once, on a client
-/// thread, with `{"ok": value}` or `{"error": {"kind", "message"}}`.
+/// Runs a JSON request (see `rpc.rs`). `done` is called once with
+/// `{"ok": value}` or `{"error": {"kind", "message"}}`, on a client, calling,
+/// or closing thread.
 ///
 /// # Safety
 ///
 /// `client` comes from [`wici_client_open`] and is not closed; `request` is
 /// a NUL-terminated string; `context` stays valid and thread-safe until
-/// `done` runs.
+/// `done` runs. Serialize this function against close. Callbacks must return
+/// promptly and must not call close. At most 256 calls may be pending; excess
+/// calls return `busy`. Interrupted calls return `outcome_unknown`: a durable
+/// write may have committed, so reconcile before retrying.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wici_client_call(
     client: *const WiciClient,
@@ -222,25 +256,38 @@ pub unsafe extern "C" fn wici_client_call(
         callback.call(&rpc::Failure::new("invalid_request", "null or non-UTF-8 request").to_json());
         return;
     };
-    let client = Arc::clone(&handle.client);
-    handle.runtime.spawn(async move {
-        // The inner task turns a panic into a join error.
-        let call = tokio::spawn(async move { rpc::call(&client, &request).await });
-        let value = match call.await {
-            Ok(Ok(value)) => json!({ "ok": value }),
-            Ok(Err(failure)) => failure.to_json(),
-            Err(_) => rpc::Failure::new("internal", "internal error").to_json(),
-        };
-        callback.call(&value);
-    });
+    let reply = Reply(Some(callback));
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut calls = handle.calls.lock().unwrap_or_else(PoisonError::into_inner);
+        while calls.try_join_next().is_some() {}
+        if calls.len() >= 256 {
+            drop(calls);
+            reply.finish(&rpc::Failure::new("busy", "too many pending calls").to_json());
+            return;
+        }
+        let client = Arc::clone(&handle.client);
+        calls.spawn_on(
+            async move {
+                let value = match rpc::call(&client, &request).await {
+                    Ok(value) => json!({ "ok": value }),
+                    Err(failure) => failure.to_json(),
+                };
+                reply.finish(&value);
+            },
+            handle.runtime.handle(),
+        );
+    }));
 }
 
-/// Stops and frees a client. Waits up to two seconds for work in progress.
-/// Do not call from a Wici callback.
+/// Stops and frees a client. Interrupts pending calls and waits for all
+/// callbacks to return, then allows up to two seconds for runtime shutdown.
+/// No callback runs after return. Durable writes may still commit during
+/// shutdown; reconcile state on reopen. Do not call from a Wici callback.
 ///
 /// # Safety
 ///
-/// `client` comes from [`wici_client_open`] and is not used afterwards.
+/// `client` comes from [`wici_client_open`]. No other thread may enter a C
+/// function using it during or after close. Callbacks must return promptly.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wici_client_close(client: *mut WiciClient) {
     if client.is_null() {
@@ -249,7 +296,19 @@ pub unsafe extern "C" fn wici_client_close(client: *mut WiciClient) {
     // SAFETY: ownership returns from `wici_client_open` per the contract.
     let handle = unsafe { Box::from_raw(client) };
     let _ = catch_unwind(AssertUnwindSafe(move || {
-        let WiciClient { runtime, client } = *handle;
+        let WiciClient {
+            runtime,
+            client,
+            calls,
+            events,
+        } = *handle;
+        let mut calls = calls.into_inner().unwrap_or_else(PoisonError::into_inner);
+        calls.abort_all();
+        events.abort();
+        runtime.block_on(async {
+            while calls.join_next().await.is_some() {}
+            let _ = events.await;
+        });
         drop(client);
         runtime.shutdown_timeout(Duration::from_secs(2));
     }));
@@ -267,3 +326,6 @@ pub unsafe extern "C" fn wici_string_free(text: *mut c_char) {
         drop(unsafe { CString::from_raw(text) });
     }
 }
+
+#[cfg(test)]
+mod shutdown_tests;

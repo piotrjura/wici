@@ -1,7 +1,7 @@
 # Wici plan
 
-Status: protocol, crypto, server, client, and artifacts exist and are tested.
-Push hints and the Swift package are planned.
+Status: protocol, crypto, server, client, artifacts, C ABI, and Swift package
+exist and have tests. Push hints and app integration are planned.
 
 ## Goal
 

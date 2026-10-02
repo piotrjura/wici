@@ -12,8 +12,9 @@ extern "C" {
 /* Opaque client. */
 typedef struct WiciClient WiciClient;
 
-/* Receives JSON. `json` is valid only during the call. Runs on a Wici
- * thread; `context` must be safe to use from any thread. */
+/* Receives JSON. `json` is valid only during the call. May run on a Wici, calling, or closing
+ * thread; `context` must be safe to use from any thread. Return promptly;
+ * never close the client inside a callback. */
 typedef void (*WiciCallback)(void *context, const char *json);
 
 /* Writes 64 random secret bytes. Keep them in the Keychain. */
@@ -31,11 +32,17 @@ WiciClient *wici_client_open(const char *config_json, const uint8_t *secret64,
                              char **error);
 
 /* Runs a JSON request such as {"method":"invite"}. `done` gets
- * {"ok": value} or {"error": {"kind", "message"}} exactly once. */
+ * {"ok": value} or {"error": {"kind", "message"}} exactly once.
+ * Serialize call entry against close. Limit: 256 pending calls; excess
+ * calls return "busy". Interruption returns "outcome_unknown": a write may
+ * have committed. Reconcile durable state before retrying an effect. */
 void wici_client_call(const WiciClient *client, const char *request_json,
                       WiciCallback done, void *context);
 
-/* Stops and frees the client. Not from inside a callback. */
+/* Stops and frees the client. Interrupts pending calls and waits for all
+ * callbacks to return. No callback runs afterwards. Must not overlap any
+ * other entry using this handle. Not from inside a callback. Durable writes
+ * may still commit during shutdown; reconcile state on reopen. */
 void wici_client_close(WiciClient *client);
 
 /* Frees a string returned by this library. */

@@ -15,6 +15,8 @@ public struct WiciConfig: Sendable {
     public var databasePath: String
     public var retryIntervalMilliseconds: Int?
     public var reconnectMinMilliseconds: Int?
+    /// Maximum queued Swift events. Must be positive. Defaults to 256.
+    public var eventBufferCapacity: Int = 256
 
     public init(serverURL: String, databasePath: String) {
         self.serverURL = serverURL
@@ -38,13 +40,35 @@ public struct WiciEvent: Sendable, Equatable {
     public let json: JSONValue
 }
 
-/// Bridges a C callback to Swift. Retained while the C side may call it.
-private final class EventSink: @unchecked Sendable {
-    let continuation: AsyncStream<WiciEvent>.Continuation
-    init(_ continuation: AsyncStream<WiciEvent>.Continuation) { self.continuation = continuation }
+/// Bounded callback bridge. AsyncThrowingStream synchronizes its continuation.
+final class EventSink: Sendable {
+    let events: AsyncThrowingStream<WiciEvent, Error>
+    private let continuation: AsyncThrowingStream<WiciEvent, Error>.Continuation
+
+    init(capacity: Int) {
+        (events, continuation) = AsyncThrowingStream.makeStream(bufferingPolicy: .bufferingOldest(capacity))
+    }
+
+    func receive(_ text: String) {
+        do {
+            let value = try JSONValue.parse(text)
+            guard let type = value["type"]?.stringValue else {
+                continuation.finish(throwing: WiciError(kind: "invalid_event", message: "missing event type"))
+                return
+            }
+            if case .dropped = continuation.yield(WiciEvent(type: type, json: value)), type != "live" {
+                continuation.finish(throwing: WiciError(
+                    kind: "event_overflow", message: "event buffer full; reopen and reconcile durable state"))
+            }
+        } catch {
+            continuation.finish(throwing: WiciError(kind: "invalid_event", message: "invalid event JSON"))
+        }
+    }
+
+    func finish() { continuation.finish() }
 }
 
-private final class ReplySink: @unchecked Sendable {
+private final class ReplySink: Sendable {
     let continuation: CheckedContinuation<JSONValue, Error>
     init(_ continuation: CheckedContinuation<JSONValue, Error>) { self.continuation = continuation }
 }
@@ -56,8 +80,7 @@ private func string(_ pointer: UnsafePointer<CChar>?) -> String {
 private let onEvent: WiciCallback = { context, json in
     guard let context else { return }
     let sink = Unmanaged<EventSink>.fromOpaque(context).takeUnretainedValue()
-    guard let value = try? JSONValue.parse(string(json)), let type = value["type"]?.stringValue else { return }
-    sink.continuation.yield(WiciEvent(type: type, json: value))
+    sink.receive(string(json))
 }
 
 private let onReply: WiciCallback = { context, json in
@@ -83,8 +106,11 @@ public final class WiciClient: @unchecked Sendable {
     private var handle: OpaquePointer?
     private let sink: Unmanaged<EventSink>
 
-    /// Events, in order. Ends after `close()`.
-    public let events: AsyncStream<WiciEvent>
+    /// Events in order; ends on close. Live updates may drop when full.
+    /// Other overflow throws `event_overflow` after draining queued events.
+    /// Reopen, read `pending` and current state, then resume consumption.
+    /// Messages stay durable until explicitly marked `handled`.
+    public let events: AsyncThrowingStream<WiciEvent, Error>
 
     /// New random device secret (64 bytes).
     public static func generateSecret() -> Data {
@@ -107,10 +133,13 @@ public final class WiciClient: @unchecked Sendable {
     /// it off the main thread.
     public init(config: WiciConfig, secret: Data) throws {
         guard secret.count == 64 else { throw WiciError(kind: "invalid_secret", message: "secret must be 64 bytes") }
-        var continuation: AsyncStream<WiciEvent>.Continuation!
-        events = AsyncStream(bufferingPolicy: .unbounded) { continuation = $0 }
-        sink = Unmanaged.passRetained(EventSink(continuation))
+        guard config.eventBufferCapacity > 0 else {
+            throw WiciError(kind: "invalid_config", message: "event buffer capacity must be positive")
+        }
         let json = try config.json()
+        let eventSink = EventSink(capacity: config.eventBufferCapacity)
+        events = eventSink.events
+        sink = Unmanaged.passRetained(eventSink)
         var error: UnsafeMutablePointer<CChar>?
         let opened = secret.withUnsafeBytes { bytes in
             wici_client_open(json, bytes.bindMemory(to: UInt8.self).baseAddress, onEvent, sink.toOpaque(), &error)
@@ -126,27 +155,33 @@ public final class WiciClient: @unchecked Sendable {
 
     deinit { close() }
 
-    /// Stops the client. Blocks up to two seconds; call it off the main thread.
+    /// Stops the client and resolves in-flight calls before returning.
+    /// Blocks during shutdown; call it off the main thread. Interrupted calls
+    /// throw `outcome_unknown`; reconcile state before retrying any effect.
     public func close() {
-        let current = lock.withLock { () -> OpaquePointer? in
-            defer { handle = nil }
-            return handle
+        lock.withLock {
+            guard let current = handle else { return }
+            handle = nil
+            wici_client_close(current)
+            sink.takeUnretainedValue().finish()
+            sink.release()
         }
-        guard let current else { return }
-        wici_client_close(current)
-        sink.takeUnretainedValue().continuation.finish()
-        sink.release()
     }
 
     /// Runs any JSON request, for example `["method": "pairs"]`.
+    /// Task cancellation does not undo or cancel an accepted call. Closing
+    /// interrupts its reply, but a durable write may already have committed.
     public func call(_ request: JSONValue) async throws -> JSONValue {
         let text = try request.text()
-        guard let current = lock.withLock({ handle }) else {
-            throw WiciError(kind: "closed", message: "client is closed")
-        }
         return try await withCheckedThrowingContinuation { continuation in
-            let context = Unmanaged.passRetained(ReplySink(continuation)).toOpaque()
-            wici_client_call(current, text, onReply, context)
+            lock.withLock {
+                guard let current = handle else {
+                    continuation.resume(throwing: WiciError(kind: "closed", message: "client is closed"))
+                    return
+                }
+                let context = Unmanaged.passRetained(ReplySink(continuation)).toOpaque()
+                wici_client_call(current, text, onReply, context)
+            }
         }
     }
 
