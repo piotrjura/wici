@@ -108,11 +108,9 @@ async fn traffic(plan: &Plan, users: Vec<User>) -> Tally {
         stop: stop_sending + plan.drain,
         snapshot_bytes: plan.snapshot_bytes,
     };
-    let count = users.len();
     let mut tasks = JoinSet::new();
     for (index, user) in users.into_iter().enumerate() {
-        let notices = (index < plan.active)
-            .then(|| (clock + stagger(plan.interval, index, count), plan.interval));
+        let notices = first_notice(plan, index).map(|delay| (clock + delay, plan.interval));
         let script = |role, notices| Script {
             role,
             pair: user.pair,
@@ -132,7 +130,13 @@ async fn traffic(plan: &Plan, users: Vec<User>) -> Tally {
     total
 }
 
-/// Spreads first notices over one interval so users do not send at once.
+/// Delay of the first notice of user `index`, or `None` if the user is idle.
+/// Active users are spread evenly over one interval so traffic stays smooth.
+fn first_notice(plan: &Plan, index: usize) -> Option<Duration> {
+    (index < plan.active).then(|| stagger(plan.interval, index, plan.active))
+}
+
+/// `interval * index / count`, or zero if it overflows.
 fn stagger(interval: Duration, index: usize, count: usize) -> Duration {
     let (Ok(index), Ok(count)) = (u32::try_from(index), u32::try_from(count.max(1))) else {
         return Duration::ZERO;
@@ -145,6 +149,19 @@ fn stagger(interval: Duration, index: usize, count: usize) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_users_spread_over_the_whole_interval() {
+        let plan = Plan {
+            users: 1000,
+            active: 4,
+            interval: Duration::from_secs(2),
+            ..Plan::new("ws://test")
+        };
+        let delays: Vec<_> = (0..6).map(|index| first_notice(&plan, index)).collect();
+        let ms = |n| Some(Duration::from_millis(n));
+        assert_eq!(delays, [ms(0), ms(500), ms(1000), ms(1500), None, None]);
+    }
 
     #[test]
     fn stagger_spreads_over_one_interval() {
