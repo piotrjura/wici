@@ -23,6 +23,7 @@ wici-crypto.workspace = true
 wici-protocol.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 wici-testkit.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

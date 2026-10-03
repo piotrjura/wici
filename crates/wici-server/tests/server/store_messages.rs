@@ -192,10 +192,14 @@ async fn ack_drops_payloads_and_validates_position() {
         [3]
     );
     let cursors = store.cursors(&b).await.unwrap();
-    assert!(
-        cursors
-            .iter()
-            .any(|c| c.lane == Lane::Data && c.acked == Position(2))
+    let lane = |lane| cursors.iter().find(|c| c.lane == lane).unwrap();
+    assert_eq!(
+        (lane(Lane::Data).acked, lane(Lane::Data).last),
+        (Position(2), Position(3))
+    );
+    assert_eq!(
+        (lane(Lane::Control).acked, lane(Lane::Control).last),
+        (Position(0), Position(0))
     );
     assert!(matches!(
         store.ack(&key, Position(4)).await,
