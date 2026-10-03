@@ -30,6 +30,9 @@ async fn full_pairing_flow() {
     let keys = invitation.accept(&a, &b.device_id(), &greeting).unwrap();
     assert_eq!(keys.peer(), b.device_id());
 
+    // Lanes exist only for active pairs.
+    assert_eq!(store.cursors(&a.device_id()).await.unwrap().len(), 0);
+    assert_eq!(store.cursors(&b.device_id()).await.unwrap().len(), 0);
     let active = store
         .approve(&a.device_id(), invitation.pair)
         .await
