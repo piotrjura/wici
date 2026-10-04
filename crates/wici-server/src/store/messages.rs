@@ -73,6 +73,8 @@ pub struct LaneCursor {
     pub lane: Lane,
     /// Last position the recipient saved.
     pub acked: Position,
+    /// Last accepted position. Equals `acked` when nothing waits.
+    pub last: Position,
 }
 
 /// Binds a message ID to its lane and ciphertext.
@@ -161,16 +163,17 @@ impl Store {
         position_from(assigned)
     }
 
-    /// Acknowledged positions of every active lane the device receives on.
+    /// Acknowledged and last positions of every active lane the device
+    /// receives on.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] on failure.
     pub async fn cursors(&self, recipient: &DeviceId) -> StoreResult<Vec<LaneCursor>> {
         let rows = sqlx::query(
-            "SELECT l.pair_id, l.lane, l.acked_position FROM lanes l \
-             JOIN pairs p ON p.id = l.pair_id \
-             WHERE l.recipient = $1 AND p.state = 'active' ORDER BY l.pair_id, l.lane",
+            // Lanes exist only while their pair is active, so no join with pairs.
+            "SELECT pair_id, lane, acked_position, next_position - 1 AS last_position \
+             FROM lanes WHERE recipient = $1 ORDER BY pair_id, lane",
         )
         .bind(recipient.as_bytes().as_slice())
         .fetch_all(&self.pool)
@@ -181,6 +184,7 @@ impl Store {
                     pair: pair_id_from(row, "pair_id")?,
                     lane: lane_from(row, "lane")?,
                     acked: position_from(row.try_get("acked_position")?)?,
+                    last: position_from(row.try_get("last_position")?)?,
                 })
             })
             .collect()

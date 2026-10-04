@@ -137,6 +137,31 @@ async fn handshake_times_out() {
 }
 
 #[tokio::test]
+async fn answered_pings_keep_an_idle_connection_open() {
+    let server = Server::with(|c| {
+        c.timeouts.idle = Duration::from_millis(300);
+        c.timeouts.ping = Duration::from_millis(50);
+    })
+    .await;
+    let (mut client, _) = Client::new(&server.url).await;
+    // Reading answers each ping with a pong.
+    client.expect_quiet(Duration::from_millis(1000)).await;
+}
+
+#[tokio::test]
+async fn silent_connection_idles_out() {
+    let server = Server::with(|c| {
+        c.timeouts.idle = Duration::from_millis(100);
+        c.timeouts.ping = Duration::from_millis(50);
+    })
+    .await;
+    let (mut client, _) = Client::new(&server.url).await;
+    // Not reading means no pongs.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(client.recv().await, None);
+}
+
+#[tokio::test]
 async fn sealed_message_round_trip_with_ack() {
     let server = Server::start().await;
     let Paired {

@@ -2521,6 +2521,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wici-load"
+version = "0.0.0"
+dependencies = [
+ "futures-util",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "wici-crypto",
+ "wici-protocol",
+ "wici-testkit",
+]
+
+[[package]]
 name = "wici-protocol"
 version = "0.0.0"
 dependencies = [
@@ -2537,6 +2549,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "futures-util",
+ "proptest",
  "rand_core 0.6.4",
  "serde_json",
  "sha2",
