@@ -352,6 +352,18 @@ async fn presence_follows_connections(backend: Backend) {
     assert!(matches!(online, ServerFrame::Presence { pair: p, .. } if p == pair));
 }
 
+async fn replaced_connection_does_not_announce_offline(backend: Backend) {
+    let (server, Paired { mut a, b, .. }) = paired_on(backend).await;
+    let secret = b.keys.to_secret();
+    let (_b, _) = Client::connect(&server.url, DeviceKeys::from_secret(&secret)).await;
+    let offline = a
+        .recv_presence_within(Duration::from_millis(500))
+        .await
+        .into_iter()
+        .any(|f| matches!(f, ServerFrame::Presence { online: false, .. }));
+    assert!(!offline, "the old connection announced offline");
+}
+
 async fn new_connection_replaces_the_old_one(backend: Backend) {
     let server = Server::on(backend, |_| {}).await;
     let keys = DeviceKeys::generate();
@@ -612,6 +624,7 @@ on_every_backend!(
     live_updates_reach_an_online_peer,
     unpair_stops_all_traffic,
     presence_follows_connections,
+    replaced_connection_does_not_announce_offline,
     new_connection_replaces_the_old_one,
     bad_frames_get_errors_and_the_connection_survives,
     delivery_window_limits_messages_in_flight,

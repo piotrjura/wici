@@ -113,17 +113,24 @@ impl Client {
 
     /// Asserts that no frame other than presence arrives within `wait`.
     pub(crate) async fn expect_quiet(&mut self, wait: Duration) {
+        self.recv_presence_within(wait).await;
+    }
+
+    /// Presence frames that arrive within `wait`. Fails on any other frame.
+    pub(crate) async fn recv_presence_within(&mut self, wait: Duration) -> Vec<ServerFrame> {
         let deadline = tokio::time::Instant::now() + wait;
+        let mut frames = Vec::new();
         loop {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             match tokio::time::timeout(left, self.socket.next()).await {
-                Err(_) => return,
+                Err(_) => return frames,
                 Ok(Some(Ok(Message::Text(text)))) => {
                     let frame: ServerFrame = decode(text.as_str(), usize::MAX).unwrap();
                     assert!(
                         matches!(frame, ServerFrame::Presence { .. }),
                         "unexpected {frame:?}"
                     );
+                    frames.push(frame);
                 }
                 Ok(Some(Ok(_))) => {}
                 Ok(other) => panic!("socket ended: {other:?}"),

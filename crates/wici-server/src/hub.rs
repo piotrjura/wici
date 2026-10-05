@@ -89,6 +89,18 @@ impl Hub {
         self.peers().get(device).cloned()
     }
 
+    /// Queues `frame` for `to` unless `device` is online. Holds the lock, so
+    /// the frame comes before anything a newer connection of `device` sends.
+    pub(crate) fn send_unless_online(&self, device: &DeviceId, to: &DeviceId, frame: ServerFrame) {
+        let peers = self.peers();
+        if peers.contains_key(device) {
+            return;
+        }
+        if let Some(peer) = peers.get(to) {
+            peer.send_control(frame);
+        }
+    }
+
     /// Wakes the device's delivery loop, if online.
     pub(crate) fn wake(&self, device: &DeviceId) {
         if let Some(peer) = self.get(device) {
@@ -153,6 +165,23 @@ mod tests {
         );
         hub.unregister(&device, &new);
         assert!(hub.get(&device).is_none());
+    }
+
+    #[test]
+    fn offline_notice_is_dropped_while_the_device_is_online() {
+        let hub = Hub::default();
+        let device = DeviceId::from_bytes([4; 32]);
+        let other = DeviceId::from_bytes([5; 32]);
+        let (to, mut control, _) = peer(2);
+        hub.register(other, to);
+        let (own, _, _) = peer(1);
+        hub.register(device, own.clone());
+        hub.send_unless_online(&device, &other, frame());
+        assert!(control.try_recv().is_err());
+        hub.unregister(&device, &own);
+        hub.send_unless_online(&device, &other, frame());
+        assert!(control.try_recv().is_ok());
+        hub.send_unless_online(&device, &DeviceId::from_bytes([6; 32]), frame());
     }
 
     #[test]
