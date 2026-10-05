@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run a command with WICI_TEST_DATABASE_URL set. Starts a temporary
-# PostgreSQL cluster unless the variable is already set.
+# PostgreSQL cluster unless the variable is already set. SQLite test files
+# go to a directory that is deleted on exit.
 set -euo pipefail
 
 if [[ -n "${WICI_TEST_DATABASE_URL:-}" ]]; then
@@ -21,4 +22,5 @@ pg_ctl -D "$dir/data" -l "$dir/log" -w \
     start >/dev/null
 
 export WICI_TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$port/postgres"
+export WICI_TEST_SQLITE_DIR="$dir/sqlite"
 "$@"

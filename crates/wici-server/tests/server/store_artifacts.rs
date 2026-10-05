@@ -4,7 +4,7 @@ use wici_crypto::{ArtifactKey, artifact_hash};
 use wici_protocol::{ArtifactId, Blob, DeviceId, FixedBytes, PairId};
 use wici_server::store::{ArtifactLimits, ChunkUpload, Progress, Store, StoreError};
 
-use crate::support::{active_pair, device, store};
+use crate::support::{Backend, active_pair, device, on_every_backend, store};
 
 const LIMITS: ArtifactLimits = ArtifactLimits {
     max_bytes: 1 << 20,
@@ -49,9 +49,8 @@ async fn put(
     store.put_chunk(from, &chunk, LIMITS).await
 }
 
-#[tokio::test]
-async fn upload_in_order_then_download() {
-    let store = store().await;
+async fn upload_in_order_then_download(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, b) = active_pair(&store).await;
     let artifact = sealed(100);
     let total = artifact.bytes.len();
@@ -89,9 +88,8 @@ async fn upload_in_order_then_download() {
     ));
 }
 
-#[tokio::test]
-async fn repeated_chunks_resume_and_gaps_are_rejected() {
-    let store = store().await;
+async fn repeated_chunks_resume_and_gaps_are_rejected(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, _) = active_pair(&store).await;
     let artifact = sealed(100);
     put(&store, &a, pair, &artifact, 0..40).await.unwrap();
@@ -103,9 +101,8 @@ async fn repeated_chunks_resume_and_gaps_are_rejected() {
     assert!(matches!(empty, Err(StoreError::Forbidden)));
 }
 
-#[tokio::test]
-async fn hash_mismatch_deletes_the_upload() {
-    let store = store().await;
+async fn hash_mismatch_deletes_the_upload(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, b) = active_pair(&store).await;
     let mut artifact = sealed(10);
     artifact.hash = FixedBytes::new([0; 32]);
@@ -128,9 +125,8 @@ async fn hash_mismatch_deletes_the_upload() {
     );
 }
 
-#[tokio::test]
-async fn changed_metadata_conflicts() {
-    let store = store().await;
+async fn changed_metadata_conflicts(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, b) = active_pair(&store).await;
     let artifact = sealed(10);
     put(&store, &a, pair, &artifact, 0..5).await.unwrap();
@@ -152,9 +148,8 @@ async fn changed_metadata_conflicts() {
     );
 }
 
-#[tokio::test]
-async fn size_and_count_limits_apply() {
-    let store = store().await;
+async fn size_and_count_limits_apply(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, _) = active_pair(&store).await;
     let huge = sealed(2 << 20);
     assert!(matches!(
@@ -170,9 +165,8 @@ async fn size_and_count_limits_apply() {
     );
 }
 
-#[tokio::test]
-async fn only_members_of_active_pairs_use_artifacts() {
-    let store = store().await;
+async fn only_members_of_active_pairs_use_artifacts(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, b) = active_pair(&store).await;
     let stranger = device(&store).await.device_id();
     let artifact = sealed(10);
@@ -195,9 +189,8 @@ async fn only_members_of_active_pairs_use_artifacts() {
     ));
 }
 
-#[tokio::test]
-async fn unpair_and_retention_delete_artifacts() {
-    let store = store().await;
+async fn unpair_and_retention_delete_artifacts(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, _) = active_pair(&store).await;
     put(&store, &a, pair, &sealed(10), 0..100).await.unwrap();
     put(&store, &a, pair, &sealed(10), 0..1).await.unwrap();
@@ -225,3 +218,13 @@ async fn unpair_and_retention_delete_artifacts() {
         "already gone"
     );
 }
+
+on_every_backend!(
+    upload_in_order_then_download,
+    repeated_chunks_resume_and_gaps_are_rejected,
+    hash_mismatch_deletes_the_upload,
+    changed_metadata_conflicts,
+    size_and_count_limits_apply,
+    only_members_of_active_pairs_use_artifacts,
+    unpair_and_retention_delete_artifacts,
+);

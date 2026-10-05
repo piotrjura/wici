@@ -4,15 +4,12 @@ use wici_protocol::{FixedBytes, PairId, PairState};
 use wici_server::store::{StoreError, StoreLimits};
 
 use crate::support::{
-    TTL, active_pair, claim, device, invite, invite_with_ttl, store, store_with, try_claim,
+    Backend, TTL, active_pair, claim, device, invite, invite_with_ttl, invited, on_every_backend,
+    store, store_with, try_claim,
 };
 
-#[tokio::test]
-async fn full_pairing_flow() {
-    let store = store().await;
-    let a = device(&store).await;
-    let b = device(&store).await;
-    let invitation = invite(&store, &a).await;
+async fn full_pairing_flow(backend: Backend) {
+    let (store, a, b, invitation) = invited(backend).await;
 
     claim(&store, &invitation, &b).await;
     let pairs = store.pairs_of(&a.device_id()).await.unwrap();
@@ -44,12 +41,8 @@ async fn full_pairing_flow() {
     assert_eq!(store.cursors(&b.device_id()).await.unwrap().len(), 2);
 }
 
-#[tokio::test]
-async fn repeated_requests_are_idempotent() {
-    let store = store().await;
-    let a = device(&store).await;
-    let b = device(&store).await;
-    let invitation = invite(&store, &a).await;
+async fn repeated_requests_are_idempotent(backend: Backend) {
+    let (store, a, b, invitation) = invited(backend).await;
     let again = store
         .invite(
             &a.device_id(),
@@ -76,12 +69,8 @@ async fn repeated_requests_are_idempotent() {
     assert_eq!(again.state, PairState::Revoked);
 }
 
-#[tokio::test]
-async fn invitation_id_reuse_with_other_data_conflicts() {
-    let store = store().await;
-    let a = device(&store).await;
-    let b = device(&store).await;
-    let invitation = invite(&store, &a).await;
+async fn invitation_id_reuse_with_other_data_conflicts(backend: Backend) {
+    let (store, a, b, invitation) = invited(backend).await;
     let other_hash = FixedBytes::new([9; 32]);
     let result = store
         .invite(&a.device_id(), invitation.pair, &other_hash, TTL)
@@ -94,12 +83,8 @@ async fn invitation_id_reuse_with_other_data_conflicts() {
     assert!(matches!(result, Err(StoreError::Conflict)));
 }
 
-#[tokio::test]
-async fn claim_needs_the_secret_and_another_device() {
-    let store = store().await;
-    let a = device(&store).await;
-    let b = device(&store).await;
-    let invitation = invite(&store, &a).await;
+async fn claim_needs_the_secret_and_another_device(backend: Backend) {
+    let (store, a, b, invitation) = invited(backend).await;
     let wrong = Some(FixedBytes::new([1; 32]));
     let result = try_claim(&store, &invitation, &b, wrong, TTL).await;
     assert!(matches!(result, Err(StoreError::Forbidden)));
@@ -110,9 +95,8 @@ async fn claim_needs_the_secret_and_another_device() {
     );
 }
 
-#[tokio::test]
-async fn claimed_invitation_cannot_be_stolen() {
-    let store = store().await;
+async fn claimed_invitation_cannot_be_stolen(backend: Backend) {
+    let store = store(backend).await;
     let a = device(&store).await;
     let b = device(&store).await;
     let thief = device(&store).await;
@@ -122,12 +106,8 @@ async fn claimed_invitation_cannot_be_stolen() {
     assert!(matches!(result, Err(StoreError::Forbidden)));
 }
 
-#[tokio::test]
-async fn only_the_inviter_approves_a_claimed_pair() {
-    let store = store().await;
-    let a = device(&store).await;
-    let b = device(&store).await;
-    let invitation = invite(&store, &a).await;
+async fn only_the_inviter_approves_a_claimed_pair(backend: Backend) {
+    let (store, a, b, invitation) = invited(backend).await;
     let early = store.approve(&a.device_id(), invitation.pair).await;
     assert!(
         matches!(early, Err(StoreError::Forbidden)),
@@ -138,9 +118,8 @@ async fn only_the_inviter_approves_a_claimed_pair() {
     assert!(matches!(result, Err(StoreError::Forbidden)));
 }
 
-#[tokio::test]
-async fn expired_invitation_cannot_be_claimed() {
-    let store = store().await;
+async fn expired_invitation_cannot_be_claimed(backend: Backend) {
+    let store = store(backend).await;
     let a = device(&store).await;
     let b = device(&store).await;
     let invitation = invite_with_ttl(&store, &a, Duration::ZERO).await;
@@ -150,12 +129,8 @@ async fn expired_invitation_cannot_be_claimed() {
     assert_eq!(pairs[0].state, PairState::Expired, "expiry is saved");
 }
 
-#[tokio::test]
-async fn expired_claim_cannot_be_approved() {
-    let store = store().await;
-    let a = device(&store).await;
-    let b = device(&store).await;
-    let invitation = invite(&store, &a).await;
+async fn expired_claim_cannot_be_approved(backend: Backend) {
+    let (store, a, b, invitation) = invited(backend).await;
     try_claim(&store, &invitation, &b, None, Duration::ZERO)
         .await
         .unwrap();
@@ -163,9 +138,8 @@ async fn expired_claim_cannot_be_approved() {
     assert!(matches!(result, Err(StoreError::Expired)));
 }
 
-#[tokio::test]
-async fn sweeper_expires_due_pairs_only() {
-    let store = store().await;
+async fn sweeper_expires_due_pairs_only(backend: Backend) {
+    let store = store(backend).await;
     let a = device(&store).await;
     let due = invite_with_ttl(&store, &a, Duration::ZERO).await;
     let fresh = invite(&store, &a).await;
@@ -182,13 +156,12 @@ async fn sweeper_expires_due_pairs_only() {
     );
 }
 
-#[tokio::test]
-async fn open_pairs_per_device_are_limited() {
+async fn open_pairs_per_device_are_limited(backend: Backend) {
     let limits = StoreLimits {
         max_pairs_per_device: 2,
         max_pending_per_lane: 8,
     };
-    let store = store_with(limits).await;
+    let store = store_with(backend, limits).await;
     let a = device(&store).await;
     invite(&store, &a).await;
     invite(&store, &a).await;
@@ -199,9 +172,8 @@ async fn open_pairs_per_device_are_limited() {
     assert!(matches!(result, Err(StoreError::LimitExceeded)));
 }
 
-#[tokio::test]
-async fn strangers_cannot_unpair_and_unknown_pairs_are_not_found() {
-    let store = store().await;
+async fn strangers_cannot_unpair_and_unknown_pairs_are_not_found(backend: Backend) {
+    let store = store(backend).await;
     let (pair, _, _) = active_pair(&store).await;
     let stranger = device(&store).await.device_id();
     assert!(matches!(
@@ -212,9 +184,8 @@ async fn strangers_cannot_unpair_and_unknown_pairs_are_not_found() {
     assert!(matches!(unknown, Err(StoreError::NotFound)));
 }
 
-#[tokio::test]
-async fn revoked_pair_has_no_lanes_and_never_reactivates() {
-    let store = store().await;
+async fn revoked_pair_has_no_lanes_and_never_reactivates(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, b) = active_pair(&store).await;
     store.unpair(&a, pair).await.unwrap();
     assert_eq!(store.cursors(&b).await.unwrap().len(), 0);
@@ -224,11 +195,26 @@ async fn revoked_pair_has_no_lanes_and_never_reactivates() {
     ));
 }
 
-#[tokio::test]
-async fn last_seen_is_recorded() {
-    let store = store().await;
+async fn last_seen_is_recorded(backend: Backend) {
+    let store = store(backend).await;
     let a = device(&store).await;
     assert!(store.last_seen(&a.device_id()).await.unwrap().is_some());
     let unknown = wici_crypto::DeviceKeys::generate().device_id();
     assert_eq!(store.last_seen(&unknown).await.unwrap(), None);
 }
+
+on_every_backend!(
+    full_pairing_flow,
+    repeated_requests_are_idempotent,
+    invitation_id_reuse_with_other_data_conflicts,
+    claim_needs_the_secret_and_another_device,
+    claimed_invitation_cannot_be_stolen,
+    only_the_inviter_approves_a_claimed_pair,
+    expired_invitation_cannot_be_claimed,
+    expired_claim_cannot_be_approved,
+    sweeper_expires_due_pairs_only,
+    open_pairs_per_device_are_limited,
+    strangers_cannot_unpair_and_unknown_pairs_are_not_found,
+    revoked_pair_has_no_lanes_and_never_reactivates,
+    last_seen_is_recorded,
+);

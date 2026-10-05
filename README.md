@@ -16,6 +16,18 @@ Status: early. Server and Rust client work; see the [plan](docs/project-plan.md)
 Build and verification scripts find Cargo and Homebrew tools in GUI Git
 clients too. If Node is missing from PATH, they try the nvm default.
 
+## Run the server
+
+On one SQLite file, with no database server:
+
+```sh
+WICI_DATABASE_URL=sqlite:wici.db cargo run --release -p wici-server
+```
+
+For more than one server process, use PostgreSQL:
+`WICI_DATABASE_URL=postgres://user@host/db`. `WICI_LISTEN` sets the address
+(default `127.0.0.1:8080`).
+
 ## Verify
 
 ```sh

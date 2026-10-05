@@ -11,7 +11,7 @@ use wici_protocol::frame::{decode, encode};
 use wici_protocol::{
     ClientFrame, PROTOCOL_VERSION, PairId, PairInfo, PairState, ServerFrame, Timestamp,
 };
-use wici_testkit::TestServer;
+use wici_testkit::{Backend, TestServer};
 
 use wici_testkit::WAIT;
 
@@ -169,6 +169,13 @@ pub(crate) struct Paired {
     pub(crate) a_keys: PairKeys,
     pub(crate) b_keys: PairKeys,
     pub(crate) pair: PairId,
+}
+
+/// A new server on `backend` with two paired devices.
+pub(crate) async fn paired_on(backend: Backend) -> (TestServer, Paired) {
+    let server = TestServer::on(backend, |_| {}).await;
+    let paired = paired(&server).await;
+    (server, paired)
 }
 
 /// Pairs two new devices over the WebSocket protocol.

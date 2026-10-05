@@ -24,7 +24,10 @@ Claim only guarantees backed by a failure model and tests.
 
 - Protocol and state machines know nothing of storage, network, UI, agents,
   or clouds.
-- SQLite and PostgreSQL adapters stay separate from shared logic.
+- Design for adapters from the first line. Shared logic calls a trait, never
+  a concrete backend. Each backend (SQLite, PostgreSQL, network, platform) is
+  a separate adapter.
+- Every adapter passes the same tests.
 - Library and binaries share one core.
 - Thin FFI. No panic crosses it.
 - No app-specific operations in the protocol. Use adapters or extensions.
