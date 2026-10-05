@@ -56,8 +56,11 @@ pub struct ClientConfig {
     pub reconnect_max: Duration,
     /// Interval for retrying transient failures.
     pub retry_interval: Duration,
-    /// Reconnect after this long without any server frame.
+    /// Reconnect after this long without any message from the server,
+    /// including pings and pongs. Must exceed `ping`.
     pub idle: Duration,
+    /// Ping interval. Pongs prove the connection is alive.
+    pub ping: Duration,
     /// Time to connect and authenticate.
     pub connect_timeout: Duration,
     /// Events buffered for the app.
@@ -80,7 +83,8 @@ impl ClientConfig {
             reconnect_min: Duration::from_millis(200),
             reconnect_max: Duration::from_secs(30),
             retry_interval: Duration::from_secs(1),
-            idle: Duration::from_secs(60),
+            idle: Duration::from_secs(45),
+            ping: Duration::from_secs(15),
             connect_timeout: Duration::from_secs(10),
             event_buffer: 256,
             max_artifact_bytes: 64 * 1024 * 1024,

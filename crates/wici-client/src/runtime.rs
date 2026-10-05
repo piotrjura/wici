@@ -1,5 +1,7 @@
-//! Connection task: connect, authenticate, exchange frames, reconnect.
+//! Connection task: connect, authenticate, exchange frames, detect dead
+//! connections with pings, reconnect.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -7,11 +9,13 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time::Sleep;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use wici_protocol::frame::{decode, encode};
 use wici_protocol::{ClientFrame, PROTOCOL_VERSION, PairInfo, ServerFrame};
 
+use crate::ClientConfig;
 use crate::backoff::Backoff;
 use crate::inbound;
 use crate::model::Event;
@@ -94,14 +98,26 @@ async fn connect(shared: &Shared) -> Result<(Socket, Vec<PairInfo>), Closed> {
 /// Next server frame. `None` when the socket closes or sends garbage.
 async fn read<S>(stream: &mut S) -> Option<ServerFrame>
 where
-    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    S: futures_util::Stream<Item = WsResult> + Unpin,
 {
     loop {
-        match stream.next().await?.ok()? {
-            Message::Text(text) => return decode(text.as_str(), MAX_FRAME).ok(),
-            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
-            Message::Binary(_) | Message::Close(_) => return None,
+        if let Some(frame) = classify(stream.next().await).ok()? {
+            return Some(frame);
         }
+    }
+}
+
+type WsResult = Result<Message, tokio_tungstenite::tungstenite::Error>;
+
+/// What one WebSocket message means: a frame, `None` for a ping or pong, or
+/// `Closed` when the socket ends or sends garbage.
+fn classify(message: Option<WsResult>) -> Result<Option<ServerFrame>, Closed> {
+    match message.ok_or(Closed)?.map_err(|_| Closed)? {
+        Message::Text(text) => decode(text.as_str(), MAX_FRAME)
+            .map(Some)
+            .map_err(|_| Closed),
+        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(None),
+        Message::Binary(_) | Message::Close(_) => Err(Closed),
     }
 }
 
@@ -153,24 +169,109 @@ async fn exchange(
     connection: &mut Connection,
     inputs: &mut Inputs,
 ) -> Result<(), Closed> {
-    let mut retry = tokio::time::interval(shared.config.retry_interval);
+    let mut timers = Timers::new(&shared.config);
     loop {
-        tokio::select! {
-            () = shared.stop.cancelled() => return Ok(()),
-            frame = tokio::time::timeout(shared.config.idle, read(stream)) => {
-                let frame = frame.map_err(|_| Closed)?.ok_or(Closed)?;
-                receive(shared, sink, frame, connection).await?;
+        match next_step(shared, stream, inputs, &mut timers).await {
+            Step::Stop => return Ok(()),
+            Step::Idle => {
+                tracing::debug!("connection idle");
+                return Err(Closed);
             }
-            () = shared.wake.notified() => flush(shared, sink, &mut connection.flight).await?,
-            Some(frame) = inputs.live.recv() => write(sink, &frame).await?,
-            Some(request) = inputs.requests.recv() => {
-                write(sink, &request.frame).await?;
-                connection.waiters.insert(request.artifact, request.reply);
+            Step::Message(message) => {
+                timers.alive(&shared.config);
+                if let Some(frame) = classify(message)? {
+                    receive(shared, sink, frame, connection).await?;
+                }
             }
-            _ = retry.tick() => {
-                connection.flight.retry();
-                flush(shared, sink, &mut connection.flight).await?;
-            }
+            Step::Local(local) => send_local(shared, sink, local, connection).await?,
+        }
+    }
+}
+
+/// Timers of one connection.
+struct Timers {
+    retry: tokio::time::Interval,
+    ping: tokio::time::Interval,
+    /// Only server messages restart it. Local work must not hide a dead socket.
+    idle: Pin<Box<Sleep>>,
+}
+
+impl Timers {
+    fn new(config: &ClientConfig) -> Self {
+        let mut ping = tokio::time::interval(config.ping);
+        ping.reset();
+        Self {
+            retry: tokio::time::interval(config.retry_interval),
+            ping,
+            idle: Box::pin(tokio::time::sleep(config.idle)),
+        }
+    }
+
+    /// The server sent something: restart the idle timer.
+    fn alive(&mut self, config: &ClientConfig) {
+        self.idle
+            .as_mut()
+            .reset(tokio::time::Instant::now() + config.idle);
+    }
+}
+
+/// What the connection does next.
+enum Step {
+    Stop,
+    Idle,
+    Message(Option<WsResult>),
+    Local(Local),
+}
+
+/// Something to send, asked for by a timer or the app.
+enum Local {
+    Ping,
+    Wake,
+    Live(ClientFrame),
+    Request(Request),
+    Retry,
+}
+
+async fn next_step(
+    shared: &Shared,
+    stream: &mut Stream,
+    inputs: &mut Inputs,
+    timers: &mut Timers,
+) -> Step {
+    tokio::select! {
+        () = shared.stop.cancelled() => Step::Stop,
+        () = &mut timers.idle => Step::Idle,
+        message = stream.next() => Step::Message(message),
+        _ = timers.ping.tick() => Step::Local(Local::Ping),
+        () = shared.wake.notified() => Step::Local(Local::Wake),
+        Some(frame) = inputs.live.recv() => Step::Local(Local::Live(frame)),
+        Some(request) = inputs.requests.recv() => Step::Local(Local::Request(request)),
+        _ = timers.retry.tick() => Step::Local(Local::Retry),
+    }
+}
+
+/// Sends what a local step asks for.
+async fn send_local(
+    shared: &Shared,
+    sink: &mut Sink,
+    local: Local,
+    connection: &mut Connection,
+) -> Result<(), Closed> {
+    match local {
+        Local::Ping => sink
+            .send(Message::Ping(Vec::new().into()))
+            .await
+            .map_err(|_| Closed),
+        Local::Wake => flush(shared, sink, &mut connection.flight).await,
+        Local::Live(frame) => write(sink, &frame).await,
+        Local::Request(request) => {
+            write(sink, &request.frame).await?;
+            connection.waiters.insert(request.artifact, request.reply);
+            Ok(())
+        }
+        Local::Retry => {
+            connection.flight.retry();
+            flush(shared, sink, &mut connection.flight).await
         }
     }
 }

@@ -124,7 +124,8 @@ impl Connection {
         }
     }
 
-    /// Tells online peers that this device went offline.
+    /// Tells online peers that this device went offline. Says nothing if a
+    /// newer connection of the device is registered.
     pub(crate) async fn announce_offline(&mut self) {
         let _ = self.refresh_active().await;
         if let Err(error) = self.app.store.touch_device(&self.device).await {
@@ -132,13 +133,12 @@ impl Connection {
         }
         let last_seen = self.app.store.last_seen(&self.device).await.ok().flatten();
         for (pair, other) in &self.active {
-            if let Some(peer) = self.app.hub.get(other) {
-                peer.send_control(ServerFrame::Presence {
-                    pair: *pair,
-                    online: false,
-                    last_seen,
-                });
-            }
+            let frame = ServerFrame::Presence {
+                pair: *pair,
+                online: false,
+                last_seen,
+            };
+            self.app.hub.send_unless_online(&self.device, other, frame);
         }
     }
 
