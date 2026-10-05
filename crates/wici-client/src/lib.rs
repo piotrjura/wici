@@ -510,3 +510,14 @@ async fn report_unknown(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tls_tests {
+    #[test]
+    fn tls_selects_a_crypto_provider_without_app_initialization() {
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        assert_ne!(config.crypto_provider().cipher_suites.len(), 0);
+    }
+}

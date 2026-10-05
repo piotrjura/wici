@@ -114,3 +114,25 @@ fn refusal(frame: ServerFrame, what: &'static str) -> LoadError {
         LoadError::Protocol(what)
     }
 }
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tls_peer_failure_is_an_error_not_a_provider_panic() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("wss://{}/v1/ws", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+        });
+        let connection = tokio::spawn(async move { Device::connect(&url).await });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(LoadError::Connect(_))));
+        peer.await.unwrap();
+    }
+}

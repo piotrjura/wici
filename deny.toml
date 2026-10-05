@@ -20,6 +20,11 @@ allow = [
     "Zlib",
 ]
 
+# Mozilla trust-anchor data used when native certificate stores are unavailable.
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
 [licenses.private]
 ignore = true
 

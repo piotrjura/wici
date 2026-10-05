@@ -10,6 +10,7 @@ let package = Package(
         .target(
             name: "WiciKit",
             dependencies: ["WiciFFI"],
+            resources: [.copy("ThirdPartyNotices.txt")],
             linkerSettings: [
                 .linkedFramework("Security"),
                 .linkedFramework("CoreFoundation"),

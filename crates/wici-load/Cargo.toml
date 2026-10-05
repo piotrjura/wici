@@ -8,6 +8,8 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+# tokio-tungstenite enables TLS without choosing a crypto provider.
+rustls.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true

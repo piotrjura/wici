@@ -28,6 +28,11 @@ For more than one server process, use PostgreSQL:
 `WICI_DATABASE_URL=postgres://user@host/db`. `WICI_LISTEN` sets the address
 (default `127.0.0.1:8080`).
 
+TLS clients select the `ring` crypto provider and trust native plus Mozilla
+root certificates. Mozilla roots support iOS without a Unix certificate store.
+Certificate and hostname checks remain enabled. Swift packages bundle the
+trust-anchor license in `ThirdPartyNotices.txt`.
+
 ## Verify
 
 ```sh
