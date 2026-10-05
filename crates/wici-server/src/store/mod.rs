@@ -1,20 +1,24 @@
-//! PostgreSQL storage. Every state change commits before the server replies.
+//! Durable storage. Every state change commits before the server replies.
+//!
+//! Layers, top down: shared rules (pairs, messages, artifacts), shared SQL,
+//! and one adapter per database with its pools and SQL dialect:
+//! [`Backend::Postgres`] for shared servers, [`Backend::Sqlite`] for one file
+//! on one machine.
 
+mod adapter;
 mod artifacts;
 mod messages;
 mod pairs;
+mod postgres;
+mod sql;
+mod sqlite;
 
 use std::error::Error;
 use std::fmt;
-use std::time::Duration;
 
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-use sqlx::{PgConnection, Row};
-use uuid::Uuid;
-use wici_protocol::{
-    Blob, DeviceId, ErrorCode, Lane, MessageId, PairId, PairInfo, PairState, Position, Timestamp,
-    WireEnum,
-};
+use wici_protocol::{Blob, DeviceId, ErrorCode, PairId, PairInfo, PairState, Timestamp};
+
+use self::adapter::Adapter;
 
 pub use artifacts::{ArtifactLimits, ChunkUpload, Progress, StoredChunk};
 pub use messages::{Accepted, Delivery, LaneCursor, LaneKey, NewMessage};
@@ -152,35 +156,94 @@ pub struct StoreLimits {
     pub max_pending_per_lane: i64,
 }
 
-/// PostgreSQL store.
+/// Database behind a store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Backend {
+    /// PostgreSQL. URL `postgres://...` or `postgresql://...`.
+    Postgres,
+    /// SQLite file. URL `sqlite:path` or `sqlite://path`. One server
+    /// process per file.
+    Sqlite,
+}
+
+impl Backend {
+    /// The backend a database URL names, or `None` for other schemes.
+    #[must_use]
+    pub fn of_url(url: &str) -> Option<Self> {
+        let scheme = url.split_once(':')?.0;
+        match scheme {
+            "postgres" | "postgresql" => Some(Self::Postgres),
+            "sqlite" => Some(Self::Sqlite),
+            _ => None,
+        }
+    }
+}
+
+/// One connected adapter.
+#[derive(Debug, Clone)]
+enum Adapters {
+    Postgres(postgres::Postgres),
+    Sqlite(sqlite::Sqlite),
+}
+
+/// Runs `$body` with `$adapter` bound to the concrete adapter.
+macro_rules! dispatch {
+    ($store:expr, |$adapter:ident| $body:expr) => {
+        match &$store.adapter {
+            Adapters::Postgres($adapter) => $body,
+            Adapters::Sqlite($adapter) => $body,
+        }
+    };
+}
+use dispatch;
+
+/// Durable store on one database.
 #[derive(Debug, Clone)]
 pub struct Store {
-    pool: PgPool,
+    adapter: Adapters,
     limits: StoreLimits,
 }
 
 impl Store {
-    /// Connects and runs migrations.
+    /// Connects to the database [`Backend::of_url`] picks and runs its
+    /// migrations. A SQLite file is created if missing.
+    ///
+    /// `max_connections` caps PostgreSQL connections. SQLite uses one writer
+    /// and up to `max_connections` readers.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] if the database is unreachable or a
-    /// migration fails.
+    /// [`StoreError::Database`] for an unsupported URL, an unreachable
+    /// database, or a failed migration. The error never contains the URL.
     pub async fn connect(
         url: &str,
         max_connections: u32,
         limits: StoreLimits,
     ) -> StoreResult<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            .acquire_timeout(Duration::from_secs(5))
-            .connect(url)
-            .await?;
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .map_err(|e| StoreError::Database(e.into()))?;
-        Ok(Self { pool, limits })
+        let adapter = match Backend::of_url(url) {
+            Some(Backend::Postgres) => {
+                Adapters::Postgres(postgres::Postgres::connect(url, max_connections).await?)
+            }
+            Some(Backend::Sqlite) => {
+                Adapters::Sqlite(sqlite::Sqlite::connect(url, max_connections).await?)
+            }
+            None => {
+                let error = "database URL must start with postgres:, postgresql:, or sqlite:";
+                return Err(StoreError::Database(sqlx::Error::Configuration(
+                    error.into(),
+                )));
+            }
+        };
+        Ok(Self { adapter, limits })
+    }
+
+    /// The database this store uses.
+    #[must_use]
+    pub const fn backend(&self) -> Backend {
+        match self.adapter {
+            Adapters::Postgres(_) => Backend::Postgres,
+            Adapters::Sqlite(_) => Backend::Sqlite,
+        }
     }
 
     /// Records that a device connected.
@@ -189,14 +252,9 @@ impl Store {
     ///
     /// [`StoreError::Database`] on failure.
     pub async fn touch_device(&self, id: &DeviceId) -> StoreResult<()> {
-        sqlx::query(
-            "INSERT INTO devices (id) VALUES ($1) \
-             ON CONFLICT (id) DO UPDATE SET last_seen_at = now()",
-        )
-        .bind(id.as_bytes().as_slice())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        dispatch!(self, |a| {
+            sql::pairs::touch_device(&mut *a.writer().acquire().await?, id).await
+        })
     }
 
     /// Last time a device was connected.
@@ -205,70 +263,45 @@ impl Store {
     ///
     /// [`StoreError::Database`] on failure.
     pub async fn last_seen(&self, id: &DeviceId) -> StoreResult<Option<Timestamp>> {
-        let millis: Option<i64> = sqlx::query_scalar(&format!(
-            "SELECT {} FROM devices WHERE id = $1",
-            millis_of("last_seen_at")
-        ))
-        .bind(id.as_bytes().as_slice())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(timestamp(millis))
+        let millis = dispatch!(self, |a| {
+            sql::pairs::last_seen(&mut *a.reader().acquire().await?, id).await
+        })?;
+        Ok(sql::timestamp(millis))
     }
 }
 
-// Row and type conversion shared by the submodules.
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn millis_of(column: &str) -> String {
-    format!("(extract(epoch FROM {column}) * 1000)::BIGINT")
-}
+    #[test]
+    fn backend_follows_the_url_scheme() {
+        let cases = [
+            ("postgres://u@h/db", Some(Backend::Postgres)),
+            ("postgresql://u@h/db", Some(Backend::Postgres)),
+            ("sqlite:wici.db", Some(Backend::Sqlite)),
+            ("sqlite:///var/lib/wici.db", Some(Backend::Sqlite)),
+            ("mysql://u@h/db", None),
+            ("wici.db", None),
+            ("", None),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(Backend::of_url(url), expected, "{url}");
+        }
+    }
 
-const fn pg_uuid(bytes: &[u8; 16]) -> Uuid {
-    Uuid::from_bytes(*bytes)
-}
-
-fn device_from(bytes: &[u8]) -> StoreResult<DeviceId> {
-    <[u8; 32]>::try_from(bytes)
-        .map(DeviceId::from_bytes)
-        .map_err(|_| StoreError::corrupt("device ID length"))
-}
-
-fn timestamp(millis: Option<i64>) -> Option<Timestamp> {
-    millis.and_then(|ms| u64::try_from(ms).ok()).map(Timestamp)
-}
-
-fn position_from(value: i64) -> StoreResult<Position> {
-    u64::try_from(value)
-        .map(Position)
-        .map_err(|_| StoreError::corrupt("negative position"))
-}
-
-fn position_value(position: Position) -> StoreResult<i64> {
-    i64::try_from(position.0).map_err(|_| StoreError::Forbidden)
-}
-
-fn wire_from<T: WireEnum>(text: &str) -> StoreResult<T> {
-    wici_protocol::wire::parse(text).map_err(|_| StoreError::corrupt("unknown wire name"))
-}
-
-fn pair_id_from(row: &PgRow, column: &str) -> StoreResult<PairId> {
-    let id: Uuid = row.try_get(column)?;
-    Ok(PairId::from_bytes(*id.as_bytes()))
-}
-
-fn message_id_from(row: &PgRow, column: &str) -> StoreResult<MessageId> {
-    let id: Uuid = row.try_get(column)?;
-    Ok(MessageId::from_bytes(*id.as_bytes()))
-}
-
-fn lane_from(row: &PgRow, column: &str) -> StoreResult<Lane> {
-    wire_from(&row.try_get::<String, _>(column)?)
-}
-
-/// Locks the device row. Serializes per-device limit checks.
-async fn lock_device(conn: &mut PgConnection, id: &DeviceId) -> StoreResult<()> {
-    sqlx::query("SELECT 1 FROM devices WHERE id = $1 FOR UPDATE")
-        .bind(id.as_bytes().as_slice())
-        .execute(conn)
-        .await?;
-    Ok(())
+    #[tokio::test]
+    async fn unsupported_url_fails_without_echoing_it() {
+        let limits = StoreLimits {
+            max_pairs_per_device: 1,
+            max_pending_per_lane: 1,
+        };
+        let error = Store::connect("mysql://user:secret@host/db", 1, limits)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Database(_)));
+        let detail = error.source().map(ToString::to_string).unwrap_or_default();
+        assert!(detail.contains("must start with"), "{detail}");
+        assert!(!detail.contains("secret"), "{detail}");
+    }
 }

@@ -12,7 +12,7 @@ axum.workspace = true
 futures-util.workspace = true
 rand_core.workspace = true
 sha2.workspace = true
-sqlx = { workspace = true, features = ["postgres", "uuid"] }
+sqlx = { workspace = true, features = ["postgres", "sqlite", "uuid"] }
 subtle.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::store::{ArtifactLimits, StoreLimits};
+use crate::store::{ArtifactLimits, Backend, StoreLimits};
 
 /// Size, rate, and queue limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,9 +103,9 @@ impl Default for Timeouts {
 pub struct Config {
     /// Listen address.
     pub listen: SocketAddr,
-    /// PostgreSQL URL.
+    /// Database URL. [`Backend::of_url`] picks the backend.
     pub database_url: String,
-    /// Database connections.
+    /// PostgreSQL connections, or SQLite readers.
     pub database_connections: u32,
     /// Limits.
     pub limits: Limits,
@@ -126,15 +126,21 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl Config {
-    /// Reads `WICI_DATABASE_URL` (required), `WICI_LISTEN` (default
-    /// `127.0.0.1:8080`), and `WICI_DATABASE_CONNECTIONS` (default 16).
+    /// Reads `WICI_DATABASE_URL` (required: `postgres://...` or
+    /// `sqlite:path`), `WICI_LISTEN` (default `127.0.0.1:8080`), and
+    /// `WICI_DATABASE_CONNECTIONS` (default 16).
     ///
     /// # Errors
     ///
-    /// [`ConfigError`] for a missing URL or unparsable values.
+    /// [`ConfigError`] for a missing or unsupported URL or unparsable values.
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let database_url = get("WICI_DATABASE_URL")
             .ok_or_else(|| ConfigError("WICI_DATABASE_URL is required".to_owned()))?;
+        if Backend::of_url(&database_url).is_none() {
+            return Err(ConfigError(
+                "WICI_DATABASE_URL must start with postgres:, postgresql:, or sqlite:".to_owned(),
+            ));
+        }
         let listen = get("WICI_LISTEN")
             .unwrap_or_else(|| "127.0.0.1:8080".to_owned())
             .parse()
@@ -171,6 +177,8 @@ mod tests {
         let config = Config::from_env(env(&[("WICI_DATABASE_URL", "postgres://x")])).unwrap();
         assert_eq!(config.listen.to_string(), "127.0.0.1:8080");
         assert_eq!(config.database_connections, 16);
+        let sqlite = Config::from_env(env(&[("WICI_DATABASE_URL", "sqlite:wici.db")])).unwrap();
+        assert_eq!(sqlite.database_url, "sqlite:wici.db");
         let config = Config::from_env(env(&[
             ("WICI_DATABASE_URL", "postgres://x"),
             ("WICI_LISTEN", "0.0.0.0:9"),
@@ -185,10 +193,14 @@ mod tests {
     fn rejects_missing_or_bad_values() {
         let missing = Config::from_env(env(&[])).unwrap_err();
         assert_eq!(missing.to_string(), "WICI_DATABASE_URL is required");
-        let bad_listen = env(&[("WICI_DATABASE_URL", "u"), ("WICI_LISTEN", "nope")]);
+        let unsupported = Config::from_env(env(&[("WICI_DATABASE_URL", "mysql://secret@x")]));
+        let message = unsupported.unwrap_err().to_string();
+        assert!(message.contains("must start with"), "{message}");
+        assert!(!message.contains("secret"), "no URL in errors");
+        let bad_listen = env(&[("WICI_DATABASE_URL", "sqlite:u"), ("WICI_LISTEN", "nope")]);
         assert!(Config::from_env(bad_listen).is_err());
         let bad_count = env(&[
-            ("WICI_DATABASE_URL", "u"),
+            ("WICI_DATABASE_URL", "sqlite:u"),
             ("WICI_DATABASE_CONNECTIONS", "x"),
         ]);
         assert!(Config::from_env(bad_count).is_err());

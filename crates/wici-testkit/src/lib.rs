@@ -1,9 +1,11 @@
 //! Test helpers: temporary databases and servers.
 //!
-//! Needs `WICI_TEST_DATABASE_URL`; `scripts/with-postgres.sh` sets it.
-//! Helpers panic on setup failure, which fails the calling test.
+//! PostgreSQL needs `WICI_TEST_DATABASE_URL`; `scripts/with-postgres.sh` sets
+//! it. SQLite files go to `WICI_TEST_SQLITE_DIR`, or the system temporary
+//! directory. Helpers panic on setup failure, which fails the calling test.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use sqlx::Connection;
@@ -11,6 +13,8 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use wici_server::store::{Store, StoreLimits};
+
+pub use wici_server::store::Backend;
 use wici_server::{Config, Limits, Timeouts};
 
 /// How long helpers wait before failing a test.
@@ -21,8 +25,24 @@ fn fail(what: &str, error: &dyn std::fmt::Display) -> ! {
     panic!("{what}: {error}")
 }
 
-/// Creates an empty database and returns its URL.
-pub async fn database_url() -> String {
+/// Creates an empty database on `backend` and returns its URL.
+pub async fn database_url(backend: Backend) -> String {
+    match backend {
+        Backend::Postgres => postgres_url().await,
+        Backend::Sqlite => sqlite_url(),
+    }
+}
+
+/// A URL of a new SQLite file. The store creates the file.
+fn sqlite_url() -> String {
+    let dir = std::env::var_os("WICI_TEST_SQLITE_DIR")
+        .map_or_else(|| std::env::temp_dir().join("wici-tests"), PathBuf::from);
+    std::fs::create_dir_all(&dir).unwrap_or_else(|error| fail("create SQLite test dir", &error));
+    let file = dir.join(format!("{}.db", uuid::Uuid::now_v7().simple()));
+    format!("sqlite://{}", file.display())
+}
+
+async fn postgres_url() -> String {
     let admin = std::env::var("WICI_TEST_DATABASE_URL").unwrap_or_else(|error| {
         fail(
             "WICI_TEST_DATABASE_URL (run through scripts/with-postgres.sh)",
@@ -44,8 +64,8 @@ pub async fn database_url() -> String {
 }
 
 /// A store on a fresh database.
-pub async fn store(limits: StoreLimits) -> Store {
-    Store::connect(&database_url().await, 8, limits)
+pub async fn store(backend: Backend, limits: StoreLimits) -> Store {
+    Store::connect(&database_url(backend).await, 8, limits)
         .await
         .unwrap_or_else(|error| fail("connect store", &error))
 }
@@ -77,16 +97,21 @@ pub struct TestServer {
 }
 
 impl TestServer {
-    /// Starts a server with the default configuration.
+    /// Starts a server on PostgreSQL with the default configuration.
     pub async fn start() -> Self {
         Self::with(|_| {}).await
     }
 
-    /// Starts a server after `change` edits the configuration.
+    /// Starts a server on PostgreSQL after `change` edits the configuration.
     pub async fn with(change: impl FnOnce(&mut Config)) -> Self {
+        Self::on(Backend::Postgres, change).await
+    }
+
+    /// Starts a server on `backend` after `change` edits the configuration.
+    pub async fn on(backend: Backend, change: impl FnOnce(&mut Config)) -> Self {
         let mut config = config();
         change(&mut config);
-        let database = database_url().await;
+        let database = database_url(backend).await;
         let listener = bind(config.listen).await;
         let address = listener
             .local_addr()

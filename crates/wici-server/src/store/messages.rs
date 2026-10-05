@@ -1,16 +1,17 @@
-//! Durable messages: send, fetch, ack.
+//! Durable message rules: send, fetch, ack.
 
 use sha2::{Digest, Sha256};
-use sqlx::{PgConnection, Row};
 use wici_protocol::{
     Blob, DeviceId, Lane, MessageId, PairId, PairState, Position, Timestamp, WireEnum,
 };
 
-use super::pairs::{LockMode, lock};
-use super::{
-    Store, StoreError, StoreResult, lane_from, message_id_from, millis_of, pair_id_from, pg_uuid,
-    position_from, position_value, timestamp,
+use super::adapter::{Adapter, LockMode};
+use super::pairs::lock;
+use super::sql::messages::{
+    MessageRow, allocate, cursors, drop_acked, fetch, find_sent, insert_message, raise_ack,
 };
+use super::sql::{position_from, position_value};
+use super::{Adapters, Store, StoreError, StoreLimits, StoreResult, dispatch};
 
 /// One recipient lane of a pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,71 +97,7 @@ impl Store {
     /// not a member. [`StoreError::Conflict`] for a reused ID with other
     /// content or lane. [`StoreError::LimitExceeded`] if the lane is full.
     pub async fn send(&self, sender: &DeviceId, message: &NewMessage<'_>) -> StoreResult<Accepted> {
-        let hash = payload_hash(message.lane, message.sealed);
-        let mut tx = self.pool.begin().await?;
-        // Shared lock: sends run in parallel but never after a committed revoke.
-        let pair = lock(&mut tx, message.pair, LockMode::Share).await?.record;
-        let (PairState::Active, Some(recipient)) = (pair.state, pair.peer_of(sender)) else {
-            return Err(StoreError::Forbidden);
-        };
-        if let Some((stored_hash, position)) = find_sent(&mut tx, sender, message).await? {
-            return if stored_hash == hash {
-                Ok(Accepted {
-                    position,
-                    recipient,
-                    duplicate: true,
-                })
-            } else {
-                Err(StoreError::Conflict)
-            };
-        }
-        let key = LaneKey {
-            pair: message.pair,
-            recipient,
-            lane: message.lane,
-        };
-        let position = self.allocate(&mut tx, &key).await?;
-        sqlx::query(
-            "INSERT INTO messages (pair_id, recipient, lane, position, id, sender, payload_hash, sealed) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .bind(pg_uuid(key.pair.as_bytes()))
-        .bind(recipient.as_bytes().as_slice())
-        .bind(key.lane.as_str())
-        .bind(position_value(position)?)
-        .bind(pg_uuid(message.id.as_bytes()))
-        .bind(sender.as_bytes().as_slice())
-        .bind(hash)
-        .bind(message.sealed.as_bytes())
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(Accepted {
-            position,
-            recipient,
-            duplicate: false,
-        })
-    }
-
-    /// Takes the next position of a lane. The row lock orders concurrent
-    /// senders, and a rollback returns the position, so positions never skip.
-    async fn allocate(&self, conn: &mut PgConnection, key: &LaneKey) -> StoreResult<Position> {
-        let row = sqlx::query(
-            "UPDATE lanes SET next_position = next_position + 1 \
-             WHERE pair_id = $1 AND recipient = $2 AND lane = $3 \
-             RETURNING next_position - 1 AS position, acked_position",
-        )
-        .bind(pg_uuid(key.pair.as_bytes()))
-        .bind(key.recipient.as_bytes().as_slice())
-        .bind(key.lane.as_str())
-        .fetch_one(conn)
-        .await?;
-        let assigned: i64 = row.try_get("position")?;
-        let acked: i64 = row.try_get("acked_position")?;
-        if assigned - acked > self.limits.max_pending_per_lane {
-            return Err(StoreError::LimitExceeded);
-        }
-        position_from(assigned)
+        dispatch!(self, |a| send(a, self.limits, sender, message).await)
     }
 
     /// Acknowledged and last positions of every active lane the device
@@ -170,24 +107,9 @@ impl Store {
     ///
     /// [`StoreError::Database`] on failure.
     pub async fn cursors(&self, recipient: &DeviceId) -> StoreResult<Vec<LaneCursor>> {
-        let rows = sqlx::query(
-            // Lanes exist only while their pair is active, so no join with pairs.
-            "SELECT pair_id, lane, acked_position, next_position - 1 AS last_position \
-             FROM lanes WHERE recipient = $1 ORDER BY pair_id, lane",
-        )
-        .bind(recipient.as_bytes().as_slice())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter()
-            .map(|row| {
-                Ok(LaneCursor {
-                    pair: pair_id_from(row, "pair_id")?,
-                    lane: lane_from(row, "lane")?,
-                    acked: position_from(row.try_get("acked_position")?)?,
-                    last: position_from(row.try_get("last_position")?)?,
-                })
-            })
-            .collect()
+        dispatch!(self, |a| {
+            cursors(&mut *a.reader().acquire().await?, recipient).await
+        })
     }
 
     /// Up to `limit` unacknowledged messages after `after`, in position order.
@@ -201,31 +123,10 @@ impl Store {
         after: Position,
         limit: i64,
     ) -> StoreResult<Vec<Delivery>> {
-        let rows = sqlx::query(&format!(
-            "SELECT position, id, sealed, {} AS accepted_ms FROM messages \
-             WHERE pair_id = $1 AND recipient = $2 AND lane = $3 \
-             AND position > $4 AND sealed IS NOT NULL ORDER BY position LIMIT $5",
-            millis_of("accepted_at")
-        ))
-        .bind(pg_uuid(key.pair.as_bytes()))
-        .bind(key.recipient.as_bytes().as_slice())
-        .bind(key.lane.as_str())
-        .bind(position_value(after)?)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter()
-            .map(|row| {
-                Ok(Delivery {
-                    pair: key.pair,
-                    lane: key.lane,
-                    position: position_from(row.try_get("position")?)?,
-                    id: message_id_from(row, "id")?,
-                    accepted_at: timestamp(row.try_get("accepted_ms")?).unwrap_or(Timestamp(0)),
-                    sealed: Blob::new(row.try_get("sealed")?),
-                })
-            })
-            .collect()
+        let after = position_value(after)?;
+        dispatch!(self, |a| {
+            fetch(&mut *a.reader().acquire().await?, key, after, limit).await
+        })
     }
 
     /// Records that the recipient saved everything up to `up_to` and drops
@@ -237,69 +138,67 @@ impl Store {
     /// does not receive on this lane.
     pub async fn ack(&self, key: &LaneKey, up_to: Position) -> StoreResult<()> {
         let up_to = position_value(up_to)?;
-        let mut tx = self.pool.begin().await?;
-        let updated = exec_on_lane(
-            &mut tx,
-            "UPDATE lanes SET acked_position = greatest(acked_position, $4) \
-             WHERE pair_id = $1 AND recipient = $2 AND lane = $3 AND $4 < next_position",
-            key,
-            up_to,
-        )
-        .await?;
-        if updated == 0 {
-            return Err(StoreError::Forbidden);
-        }
-        exec_on_lane(
-            &mut tx,
-            "UPDATE messages SET sealed = NULL WHERE pair_id = $1 AND recipient = $2 \
-             AND lane = $3 AND position <= $4 AND sealed IS NOT NULL",
-            key,
-            up_to,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        dispatch!(self, |a| ack(a, key, up_to).await)
     }
 }
 
-/// Runs `sql` with `$1..$3` bound to the lane key and `$4` to `position`.
-/// Returns the affected row count.
-async fn exec_on_lane(
-    conn: &mut PgConnection,
-    sql: &str,
-    key: &LaneKey,
-    position: i64,
-) -> StoreResult<u64> {
-    let result = sqlx::query(sql)
-        .bind(pg_uuid(key.pair.as_bytes()))
-        .bind(key.recipient.as_bytes().as_slice())
-        .bind(key.lane.as_str())
-        .bind(position)
-        .execute(conn)
-        .await?;
-    Ok(result.rows_affected())
-}
-
-/// Hash and position of a message the sender already stored with this ID.
-async fn find_sent(
-    conn: &mut PgConnection,
+async fn send<A: Adapter>(
+    adapter: &A,
+    limits: StoreLimits,
     sender: &DeviceId,
     message: &NewMessage<'_>,
-) -> StoreResult<Option<(Vec<u8>, Position)>> {
-    let row = sqlx::query(
-        "SELECT payload_hash, position FROM messages \
-         WHERE pair_id = $1 AND sender = $2 AND id = $3",
-    )
-    .bind(pg_uuid(message.pair.as_bytes()))
-    .bind(sender.as_bytes().as_slice())
-    .bind(pg_uuid(message.id.as_bytes()))
-    .fetch_optional(conn)
-    .await?;
-    row.map(|row| {
-        Ok((
-            row.try_get("payload_hash")?,
-            position_from(row.try_get("position")?)?,
-        ))
+) -> StoreResult<Accepted> {
+    let hash = payload_hash(message.lane, message.sealed);
+    let mut tx = adapter.writer().begin().await?;
+    // Shared lock: sends run in parallel but never after a committed revoke.
+    let pair = lock(&mut *tx, message.pair, LockMode::Share).await?.record;
+    let (PairState::Active, Some(recipient)) = (pair.state, pair.peer_of(sender)) else {
+        return Err(StoreError::Forbidden);
+    };
+    if let Some((stored_hash, position)) = find_sent(&mut *tx, message, sender).await? {
+        return if stored_hash == hash {
+            Ok(Accepted {
+                position: position_from(position)?,
+                recipient,
+                duplicate: true,
+            })
+        } else {
+            Err(StoreError::Conflict)
+        };
+    }
+    let key = LaneKey {
+        pair: message.pair,
+        recipient,
+        lane: message.lane,
+    };
+    // A rollback returns the position, so positions never skip.
+    let slot = allocate(&mut *tx, &key).await?;
+    if slot.assigned - slot.acked > limits.max_pending_per_lane {
+        return Err(StoreError::LimitExceeded);
+    }
+    let row = MessageRow {
+        key: &key,
+        position: slot.assigned,
+        id: message.id,
+        sender,
+        payload_hash: &hash,
+        sealed: message.sealed,
+    };
+    insert_message(&mut *tx, row).await?;
+    tx.commit().await?;
+    Ok(Accepted {
+        position: position_from(slot.assigned)?,
+        recipient,
+        duplicate: false,
     })
-    .transpose()
+}
+
+async fn ack<A: Adapter>(adapter: &A, key: &LaneKey, up_to: i64) -> StoreResult<()> {
+    let mut tx = adapter.writer().begin().await?;
+    if raise_ack(&mut *tx, key, up_to).await? == 0 {
+        return Err(StoreError::Forbidden);
+    }
+    drop_acked(&mut *tx, key, up_to).await?;
+    tx.commit().await?;
+    Ok(())
 }

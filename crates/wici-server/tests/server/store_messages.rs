@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
-use sqlx::Connection;
+use sqlx::{Connection, Row};
 
-use wici_protocol::{Blob, DeviceId, Lane, MessageId, PairId, Position};
+use wici_protocol::{Blob, DeviceId, Lane, MessageId, PairId, PairState, Position};
 use wici_server::store::{Accepted, LaneKey, NewMessage, Store, StoreError, StoreLimits};
 
-use crate::support::{active_pair, device, store, store_with};
+use crate::support::{Backend, LIMITS, active_pair, device, on_every_backend, store, store_with};
 
 fn blob(byte: u8) -> Blob {
     Blob::new(vec![byte; 4])
@@ -34,9 +34,8 @@ fn positions(deliveries: &[wici_server::store::Delivery]) -> Vec<u64> {
     deliveries.iter().map(|d| d.position.0).collect()
 }
 
-#[tokio::test]
-async fn messages_get_ordered_positions_per_lane() {
-    let store = store().await;
+async fn messages_get_ordered_positions_per_lane(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, b) = active_pair(&store).await;
     for (lane, expected) in [(Lane::Control, 1), (Lane::Control, 2), (Lane::Data, 1)] {
         let accepted = send(&store, &a, pair, lane).await.unwrap();
@@ -58,9 +57,8 @@ async fn messages_get_ordered_positions_per_lane() {
     );
 }
 
-#[tokio::test]
-async fn retry_with_same_content_returns_the_original_position() {
-    let store = store().await;
+async fn retry_with_same_content_returns_the_original_position(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, _) = active_pair(&store).await;
     let sealed = blob(1);
     let message = message(pair, Lane::Control, &sealed);
@@ -70,9 +68,8 @@ async fn retry_with_same_content_returns_the_original_position() {
     assert!(again.duplicate);
 }
 
-#[tokio::test]
-async fn reused_id_with_other_content_or_lane_conflicts() {
-    let store = store().await;
+async fn reused_id_with_other_content_or_lane_conflicts(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, _) = active_pair(&store).await;
     let (one, two) = (blob(1), blob(2));
     let original = message(pair, Lane::Control, &one);
@@ -93,9 +90,8 @@ async fn reused_id_with_other_content_or_lane_conflicts() {
     }
 }
 
-#[tokio::test]
-async fn retry_after_ack_is_still_deduplicated() {
-    let store = store().await;
+async fn retry_after_ack_is_still_deduplicated(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, b) = active_pair(&store).await;
     let sealed = blob(1);
     let message = message(pair, Lane::Data, &sealed);
@@ -114,9 +110,8 @@ async fn retry_after_ack_is_still_deduplicated() {
     );
 }
 
-#[tokio::test]
-async fn concurrent_senders_never_skip_or_reuse_positions() {
-    let store = store().await;
+async fn concurrent_senders_never_skip_or_reuse_positions(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, b) = active_pair(&store).await;
     let tasks: Vec<_> = (0..40)
         .map(|i| {
@@ -142,13 +137,12 @@ async fn concurrent_senders_never_skip_or_reuse_positions() {
     assert_eq!(full, 40 - seen.values().map(HashSet::len).sum::<usize>());
 }
 
-#[tokio::test]
-async fn full_lane_rejects_until_acked() {
+async fn full_lane_rejects_until_acked(backend: Backend) {
     let limits = StoreLimits {
         max_pairs_per_device: 4,
         max_pending_per_lane: 2,
     };
-    let store = store_with(limits).await;
+    let store = store_with(backend, limits).await;
     let (pair, a, b) = active_pair(&store).await;
     send(&store, &a, pair, Lane::Data).await.unwrap();
     send(&store, &a, pair, Lane::Data).await.unwrap();
@@ -173,9 +167,8 @@ async fn full_lane_rejects_until_acked() {
     assert_eq!(next.position, Position(3), "no gap after rejection");
 }
 
-#[tokio::test]
-async fn ack_drops_payloads_and_validates_position() {
-    let store = store().await;
+async fn ack_drops_payloads_and_validates_position(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, b) = active_pair(&store).await;
     for _ in 0..3 {
         send(&store, &a, pair, Lane::Data).await.unwrap();
@@ -219,9 +212,8 @@ async fn ack_drops_payloads_and_validates_position() {
     ));
 }
 
-#[tokio::test]
-async fn non_members_and_inactive_pairs_cannot_send() {
-    let store = store().await;
+async fn non_members_and_inactive_pairs_cannot_send(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, _) = active_pair(&store).await;
     let stranger = device(&store).await.device_id();
     let forbidden = send(&store, &stranger, pair, Lane::Data).await;
@@ -235,9 +227,8 @@ async fn non_members_and_inactive_pairs_cannot_send() {
     assert!(matches!(unknown, Err(StoreError::NotFound)));
 }
 
-#[tokio::test]
-async fn revoke_deletes_queued_messages() {
-    let store = store().await;
+async fn revoke_deletes_queued_messages(backend: Backend) {
+    let store = store(backend).await;
     let (pair, a, b) = active_pair(&store).await;
     send(&store, &a, pair, Lane::Data).await.unwrap();
     store.unpair(&b, pair).await.unwrap();
@@ -249,24 +240,95 @@ async fn revoke_deletes_queued_messages() {
     assert_eq!(store.fetch(&key, Position(0), 10).await.unwrap().len(), 0);
 }
 
-#[tokio::test]
-async fn recipient_lanes_are_found_through_an_index() {
-    let url = wici_testkit::database_url().await;
-    let store = Store::connect(&url, 1, crate::support::LIMITS)
-        .await
-        .unwrap();
+async fn recipient_lanes_are_found_through_an_index(backend: Backend) {
+    let url = wici_testkit::database_url(backend).await;
+    let store = Store::connect(&url, 1, LIMITS).await.unwrap();
     let (_, _, b) = active_pair(&store).await;
-    let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+    let plan = match backend {
+        Backend::Postgres => postgres_plan(&url, &b).await,
+        Backend::Sqlite => sqlite_plan(&url, &b).await,
+    };
+    assert!(plan.contains("lanes_recipient"), "{plan}");
+}
+
+const RECIPIENT_LANES: &str = "SELECT acked_position FROM lanes WHERE recipient = $1";
+
+async fn postgres_plan(url: &str, recipient: &DeviceId) -> String {
+    let mut conn = sqlx::PgConnection::connect(url).await.unwrap();
     sqlx::query("SET enable_seqscan = off")
         .execute(&mut conn)
         .await
         .unwrap();
-    let plan: Vec<String> =
-        sqlx::query_scalar("EXPLAIN SELECT acked_position FROM lanes WHERE recipient = $1")
-            .bind(b.as_bytes().as_slice())
-            .fetch_all(&mut conn)
-            .await
-            .unwrap();
-    let plan = plan.join("\n");
-    assert!(plan.contains("lanes_recipient"), "{plan}");
+    let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {RECIPIENT_LANES}"))
+        .bind(recipient.as_bytes().as_slice())
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+    plan.join("\n")
 }
+
+async fn sqlite_plan(url: &str, recipient: &DeviceId) -> String {
+    let mut conn = sqlx::SqliteConnection::connect(url).await.unwrap();
+    let rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {RECIPIENT_LANES}"))
+        .bind(recipient.as_bytes().as_slice())
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+    let plan: Vec<String> = rows.iter().map(|row| row.get("detail")).collect();
+    plan.join("\n")
+}
+
+async fn reopened_store_keeps_pairs_and_queued_messages(backend: Backend) {
+    let url = wici_testkit::database_url(backend).await;
+    let first = Store::connect(&url, 2, LIMITS).await.unwrap();
+    let (pair, a, b) = active_pair(&first).await;
+    send(&first, &a, pair, Lane::Data).await.unwrap();
+    drop(first);
+    let store = Store::connect(&url, 2, LIMITS).await.unwrap();
+    let key = LaneKey {
+        pair,
+        recipient: b,
+        lane: Lane::Data,
+    };
+    assert_eq!(
+        positions(&store.fetch(&key, Position(0), 10).await.unwrap()),
+        [1]
+    );
+    assert_eq!(
+        store.pairs_of(&a).await.unwrap()[0].state,
+        PairState::Active
+    );
+    let next = send(&store, &a, pair, Lane::Data).await.unwrap();
+    assert_eq!(next.position, Position(2), "positions continue");
+}
+
+#[tokio::test]
+async fn sqlite_creates_a_durable_file_from_a_plain_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relay.db");
+    let url = format!("sqlite:{}", path.display());
+    let store = Store::connect(&url, 1, LIMITS).await.unwrap();
+    assert_eq!(store.backend(), Backend::Sqlite);
+    active_pair(&store).await;
+    assert!(path.exists());
+    let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+    let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(mode, "wal");
+}
+
+on_every_backend!(
+    messages_get_ordered_positions_per_lane,
+    retry_with_same_content_returns_the_original_position,
+    reused_id_with_other_content_or_lane_conflicts,
+    retry_after_ack_is_still_deduplicated,
+    concurrent_senders_never_skip_or_reuse_positions,
+    full_lane_rejects_until_acked,
+    ack_drops_payloads_and_validates_position,
+    non_members_and_inactive_pairs_cannot_send,
+    revoke_deletes_queued_messages,
+    reopened_store_keeps_pairs_and_queued_messages,
+    recipient_lanes_are_found_through_an_index,
+);

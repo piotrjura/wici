@@ -1,14 +1,17 @@
-//! Sealed artifacts: ordered chunk upload, hash check, download, cleanup.
+//! Sealed artifact rules: ordered chunk upload, hash check, download, cleanup.
 
 use std::time::Duration;
 
-use futures_util::TryStreamExt;
-use sha2::{Digest, Sha256};
-use sqlx::{PgConnection, Row};
 use wici_protocol::{ArtifactId, Blob, DeviceId, FixedBytes, PairId, PairState};
 
-use super::pairs::{LockMode, lock};
-use super::{Store, StoreError, StoreResult, pg_uuid};
+use super::adapter::{Adapter, LockMode};
+use super::pairs::lock;
+use super::sql::Exec;
+use super::sql::artifacts::{
+    Upload, artifact_hash, complete_chunk, count_incomplete, delete_artifact as delete_row,
+    expire_artifacts, insert_chunk, insert_upload, lock_upload, save_progress,
+};
+use super::{Adapters, Store, StoreError, StoreResult, dispatch};
 
 /// Artifact limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,99 +67,16 @@ fn uint(value: i64) -> StoreResult<u64> {
     u64::try_from(value).map_err(|_| StoreError::corrupt("negative size"))
 }
 
-/// Fails unless `device` belongs to the active pair. Holds a shared lock,
-/// so the pair cannot be revoked during the request.
-async fn check_member(conn: &mut PgConnection, device: &DeviceId, pair: PairId) -> StoreResult<()> {
-    let record = lock(conn, pair, LockMode::Share).await?.record;
-    if record.state == PairState::Active && record.peer_of(device).is_some() {
-        Ok(())
-    } else {
-        Err(StoreError::Forbidden)
-    }
-}
-
-/// Upload row, locked.
-struct Upload {
-    uploader: Vec<u8>,
-    total: i64,
-    hash: Vec<u8>,
-    received: i64,
-    complete: bool,
-}
-
-async fn lock_upload(
-    conn: &mut PgConnection,
-    pair: PairId,
-    artifact: ArtifactId,
-) -> StoreResult<Option<Upload>> {
-    let row = sqlx::query(
-        "SELECT uploader, total, hash, received, complete FROM artifacts \
-         WHERE pair_id = $1 AND id = $2 FOR UPDATE",
-    )
-    .bind(pg_uuid(pair.as_bytes()))
-    .bind(pg_uuid(artifact.as_bytes()))
-    .fetch_optional(conn)
-    .await?;
-    row.map(|row| {
-        Ok(Upload {
-            uploader: row.try_get("uploader")?,
-            total: row.try_get("total")?,
-            hash: row.try_get("hash")?,
-            received: row.try_get("received")?,
-            complete: row.try_get("complete")?,
+impl Upload {
+    fn progress(&self) -> StoreResult<Progress> {
+        Ok(Progress {
+            received: uint(self.received)?,
+            complete: self.complete,
         })
-    })
-    .transpose()
+    }
 }
 
 impl Store {
-    /// Starts an upload or checks that a repeat matches the first request.
-    async fn open_upload(
-        &self,
-        conn: &mut PgConnection,
-        uploader: &DeviceId,
-        chunk: &ChunkUpload<'_>,
-        limits: ArtifactLimits,
-    ) -> StoreResult<Upload> {
-        if let Some(upload) = lock_upload(conn, chunk.pair, chunk.artifact).await? {
-            let same = upload.uploader == uploader.as_bytes()
-                && upload.total == int(chunk.total)?
-                && upload.hash == chunk.hash.as_bytes();
-            return if same {
-                Ok(upload)
-            } else {
-                Err(StoreError::Conflict)
-            };
-        }
-        if chunk.total == 0 || chunk.total > limits.max_bytes {
-            return Err(StoreError::LimitExceeded);
-        }
-        let open: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM artifacts WHERE pair_id = $1 AND NOT complete",
-        )
-        .bind(pg_uuid(chunk.pair.as_bytes()))
-        .fetch_one(&mut *conn)
-        .await?;
-        if open >= limits.max_incomplete {
-            return Err(StoreError::LimitExceeded);
-        }
-        sqlx::query("INSERT INTO artifacts (pair_id, id, uploader, total, hash) VALUES ($1, $2, $3, $4, $5)")
-            .bind(pg_uuid(chunk.pair.as_bytes()))
-            .bind(pg_uuid(chunk.artifact.as_bytes()))
-            .bind(uploader.as_bytes().as_slice())
-            .bind(int(chunk.total)?)
-            .bind(chunk.hash.as_bytes().as_slice())
-            .execute(&mut *conn)
-            .await?;
-        Ok(Upload {
-            uploader: uploader.as_bytes().to_vec(),
-            total: int(chunk.total)?,
-            hash: chunk.hash.as_bytes().to_vec(),
-            received: 0,
-            complete: false,
-        })
-    }
-
     /// Stores the next chunk. A chunk before the stored end is a no-op; a
     /// chunk after it is rejected. The last chunk triggers the hash check,
     /// and a mismatch deletes the upload.
@@ -172,52 +92,7 @@ impl Store {
         chunk: &ChunkUpload<'_>,
         limits: ArtifactLimits,
     ) -> StoreResult<Progress> {
-        let mut tx = self.pool.begin().await?;
-        check_member(&mut tx, uploader, chunk.pair).await?;
-        let mut upload = self.open_upload(&mut tx, uploader, chunk, limits).await?;
-        let offset = int(chunk.offset)?;
-        if upload.complete || offset < upload.received {
-            tx.commit().await?;
-            return Ok(Progress {
-                received: uint(upload.received)?,
-                complete: upload.complete,
-            });
-        }
-        let end = offset
-            .checked_add(int(chunk.data.len() as u64)?)
-            .ok_or(StoreError::LimitExceeded)?;
-        if offset > upload.received || chunk.data.is_empty() || end > upload.total {
-            return Err(StoreError::Forbidden);
-        }
-        sqlx::query("INSERT INTO artifact_chunks (pair_id, artifact_id, start, data) VALUES ($1, $2, $3, $4)")
-            .bind(pg_uuid(chunk.pair.as_bytes()))
-            .bind(pg_uuid(chunk.artifact.as_bytes()))
-            .bind(offset)
-            .bind(chunk.data.as_bytes())
-            .execute(&mut *tx)
-            .await?;
-        upload.received = end;
-        upload.complete = end == upload.total;
-        if upload.complete && hash_of(&mut tx, chunk.pair, chunk.artifact).await? != upload.hash {
-            drop(tx);
-            self.delete_artifact(uploader, chunk.pair, chunk.artifact)
-                .await?;
-            return Err(StoreError::Conflict);
-        }
-        sqlx::query(
-            "UPDATE artifacts SET received = $3, complete = $4 WHERE pair_id = $1 AND id = $2",
-        )
-        .bind(pg_uuid(chunk.pair.as_bytes()))
-        .bind(pg_uuid(chunk.artifact.as_bytes()))
-        .bind(upload.received)
-        .bind(upload.complete)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(Progress {
-            received: uint(upload.received)?,
-            complete: upload.complete,
-        })
+        dispatch!(self, |a| put_chunk(a, uploader, chunk, limits).await)
     }
 
     /// The chunk of a complete artifact that starts at `offset`.
@@ -233,24 +108,14 @@ impl Store {
         artifact: ArtifactId,
         offset: u64,
     ) -> StoreResult<StoredChunk> {
-        let mut tx = self.pool.begin().await?;
-        check_member(&mut tx, reader, pair).await?;
-        let row = sqlx::query(
-            "SELECT a.total, c.data FROM artifacts a JOIN artifact_chunks c \
-             ON c.pair_id = a.pair_id AND c.artifact_id = a.id \
-             WHERE a.pair_id = $1 AND a.id = $2 AND a.complete AND c.start = $3",
-        )
-        .bind(pg_uuid(pair.as_bytes()))
-        .bind(pg_uuid(artifact.as_bytes()))
-        .bind(int(offset)?)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(StoreError::NotFound)?;
-        tx.commit().await?;
+        let start = int(offset)?;
+        let (total, data) = dispatch!(self, |a| {
+            get_chunk(a, reader, pair, artifact, start).await
+        })?;
         Ok(StoredChunk {
             offset,
-            total: uint(row.try_get("total")?)?,
-            data: Blob::new(row.try_get("data")?),
+            total: uint(total)?,
+            data: Blob::new(data),
         })
     }
 
@@ -265,18 +130,7 @@ impl Store {
         pair: PairId,
         artifact: ArtifactId,
     ) -> StoreResult<()> {
-        let mut tx = self.pool.begin().await?;
-        let record = lock(&mut tx, pair, LockMode::Share).await?.record;
-        if !record.members().contains(member) {
-            return Err(StoreError::Forbidden);
-        }
-        sqlx::query("DELETE FROM artifacts WHERE pair_id = $1 AND id = $2")
-            .bind(pg_uuid(pair.as_bytes()))
-            .bind(pg_uuid(artifact.as_bytes()))
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(())
+        dispatch!(self, |a| delete_artifact(a, member, pair, artifact).await)
     }
 
     /// Deletes up to `limit` artifacts: unfinished ones older than
@@ -291,35 +145,121 @@ impl Store {
         complete: Duration,
         limit: i64,
     ) -> StoreResult<u64> {
-        let deleted = sqlx::query(
-            "DELETE FROM artifacts WHERE (pair_id, id) IN (SELECT pair_id, id FROM artifacts \
-             WHERE created_at < now() - make_interval(secs => CASE WHEN complete THEN $2 ELSE $1 END) \
-             LIMIT $3)",
-        )
-        .bind(incomplete.as_secs_f64())
-        .bind(complete.as_secs_f64())
-        .bind(limit)
-        .execute(&self.pool)
-        .await?;
-        Ok(deleted.rows_affected())
+        dispatch!(self, |a| {
+            let mut conn = a.writer().acquire().await?;
+            expire_artifacts(&mut *conn, incomplete, complete, limit).await
+        })
     }
 }
 
-/// SHA-256 of an artifact's chunks in order, streamed.
-async fn hash_of(
-    conn: &mut PgConnection,
+/// Fails unless `device` belongs to the active pair. Holds a shared lock,
+/// so the pair cannot be revoked during the request.
+async fn check_member(conn: &mut impl Exec, device: &DeviceId, pair: PairId) -> StoreResult<()> {
+    let record = lock(conn, pair, LockMode::Share).await?.record;
+    if record.state == PairState::Active && record.peer_of(device).is_some() {
+        Ok(())
+    } else {
+        Err(StoreError::Forbidden)
+    }
+}
+
+/// Starts an upload or checks that a repeat matches the first request.
+async fn open_upload(
+    conn: &mut impl Exec,
+    uploader: &DeviceId,
+    chunk: &ChunkUpload<'_>,
+    limits: ArtifactLimits,
+) -> StoreResult<Upload> {
+    let total = int(chunk.total)?;
+    if let Some(upload) = lock_upload(conn, chunk.pair, chunk.artifact).await? {
+        let same = upload.uploader == uploader.as_bytes()
+            && upload.total == total
+            && upload.hash == chunk.hash.as_bytes();
+        return if same {
+            Ok(upload)
+        } else {
+            Err(StoreError::Conflict)
+        };
+    }
+    if chunk.total == 0 || chunk.total > limits.max_bytes {
+        return Err(StoreError::LimitExceeded);
+    }
+    if count_incomplete(conn, chunk.pair).await? >= limits.max_incomplete {
+        return Err(StoreError::LimitExceeded);
+    }
+    let upload = Upload {
+        uploader: uploader.as_bytes().to_vec(),
+        total,
+        hash: chunk.hash.as_bytes().to_vec(),
+        received: 0,
+        complete: false,
+    };
+    insert_upload(conn, chunk.pair, chunk.artifact, &upload).await?;
+    Ok(upload)
+}
+
+async fn put_chunk<A: Adapter>(
+    adapter: &A,
+    uploader: &DeviceId,
+    chunk: &ChunkUpload<'_>,
+    limits: ArtifactLimits,
+) -> StoreResult<Progress> {
+    let (pair, artifact) = (chunk.pair, chunk.artifact);
+    let mut tx = adapter.writer().begin().await?;
+    check_member(&mut *tx, uploader, pair).await?;
+    let mut upload = open_upload(&mut *tx, uploader, chunk, limits).await?;
+    let offset = int(chunk.offset)?;
+    if upload.complete || offset < upload.received {
+        tx.commit().await?;
+        return upload.progress();
+    }
+    let end = offset
+        .checked_add(int(chunk.data.len() as u64)?)
+        .ok_or(StoreError::LimitExceeded)?;
+    if offset > upload.received || chunk.data.is_empty() || end > upload.total {
+        return Err(StoreError::Forbidden);
+    }
+    insert_chunk(&mut *tx, pair, artifact, offset, chunk.data).await?;
+    upload.received = end;
+    upload.complete = end == upload.total;
+    if upload.complete && artifact_hash(&mut *tx, pair, artifact).await? != upload.hash {
+        delete_row(&mut *tx, pair, artifact).await?;
+        tx.commit().await?;
+        return Err(StoreError::Conflict);
+    }
+    save_progress(&mut *tx, pair, artifact, &upload).await?;
+    tx.commit().await?;
+    upload.progress()
+}
+
+async fn get_chunk<A: Adapter>(
+    adapter: &A,
+    reader: &DeviceId,
     pair: PairId,
     artifact: ArtifactId,
-) -> StoreResult<Vec<u8>> {
-    let mut rows = sqlx::query(
-        "SELECT data FROM artifact_chunks WHERE pair_id = $1 AND artifact_id = $2 ORDER BY start",
-    )
-    .bind(pg_uuid(pair.as_bytes()))
-    .bind(pg_uuid(artifact.as_bytes()))
-    .fetch(conn);
-    let mut hasher = Sha256::new();
-    while let Some(row) = rows.try_next().await? {
-        hasher.update(row.try_get::<Vec<u8>, _>("data")?);
+    start: i64,
+) -> StoreResult<(i64, Vec<u8>)> {
+    let mut tx = adapter.reader().begin().await?;
+    check_member(&mut *tx, reader, pair).await?;
+    let chunk = complete_chunk(&mut *tx, pair, artifact, start)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+    tx.commit().await?;
+    Ok(chunk)
+}
+
+async fn delete_artifact<A: Adapter>(
+    adapter: &A,
+    member: &DeviceId,
+    pair: PairId,
+    artifact: ArtifactId,
+) -> StoreResult<()> {
+    let mut tx = adapter.writer().begin().await?;
+    let record = lock(&mut *tx, pair, LockMode::Share).await?.record;
+    if !record.members().contains(member) {
+        return Err(StoreError::Forbidden);
     }
-    Ok(hasher.finalize().to_vec())
+    delete_row(&mut *tx, pair, artifact).await?;
+    tx.commit().await?;
+    Ok(())
 }

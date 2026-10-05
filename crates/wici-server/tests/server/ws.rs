@@ -8,9 +8,11 @@ use wici_protocol::{
     Position, ServerFrame, StreamId, Timestamp,
 };
 
-use wici_testkit::TestServer as Server;
+use wici_testkit::{Backend, TestServer as Server};
 
-use crate::client::{Client, Paired, expect_pair, next, open, paired, put};
+use crate::support::on_every_backend;
+
+use crate::client::{Client, Paired, expect_pair, next, open, paired, paired_on, put};
 
 fn event(text: &str) -> Body {
     Body::Event {
@@ -72,9 +74,8 @@ async fn delivered(client: &mut Client) -> (MessageId, Lane, Position, Blob) {
     (id, lane, position, sealed)
 }
 
-#[tokio::test]
-async fn handshake_rejects_bad_signature_version_and_order() {
-    let server = Server::start().await;
+async fn handshake_rejects_bad_signature_version_and_order(backend: Backend) {
+    let server = Server::on(backend, |_| {}).await;
     let keys = DeviceKeys::generate();
     let other = DeviceKeys::generate();
 
@@ -126,9 +127,8 @@ async fn handshake_rejects_bad_signature_version_and_order() {
     );
 }
 
-#[tokio::test]
-async fn handshake_times_out() {
-    let server = Server::with(|c| c.timeouts.auth = Duration::from_millis(100)).await;
+async fn handshake_times_out(backend: Backend) {
+    let server = Server::on(backend, |c| c.timeouts.auth = Duration::from_millis(100)).await;
     let (mut socket, _) = open(&server.url).await;
     assert_eq!(
         next(&mut socket).await.as_ref().and_then(error_code),
@@ -136,9 +136,8 @@ async fn handshake_times_out() {
     );
 }
 
-#[tokio::test]
-async fn answered_pings_keep_an_idle_connection_open() {
-    let server = Server::with(|c| {
+async fn answered_pings_keep_an_idle_connection_open(backend: Backend) {
+    let server = Server::on(backend, |c| {
         c.timeouts.idle = Duration::from_millis(300);
         c.timeouts.ping = Duration::from_millis(50);
     })
@@ -148,9 +147,8 @@ async fn answered_pings_keep_an_idle_connection_open() {
     client.expect_quiet(Duration::from_millis(1000)).await;
 }
 
-#[tokio::test]
-async fn silent_connection_idles_out() {
-    let server = Server::with(|c| {
+async fn silent_connection_idles_out(backend: Backend) {
+    let server = Server::on(backend, |c| {
         c.timeouts.idle = Duration::from_millis(100);
         c.timeouts.ping = Duration::from_millis(50);
     })
@@ -161,16 +159,17 @@ async fn silent_connection_idles_out() {
     assert_eq!(client.recv().await, None);
 }
 
-#[tokio::test]
-async fn sealed_message_round_trip_with_ack() {
-    let server = Server::start().await;
-    let Paired {
-        mut a,
-        mut b,
-        a_keys,
-        b_keys,
-        pair,
-    } = paired(&server).await;
+async fn sealed_message_round_trip_with_ack(backend: Backend) {
+    let (
+        server,
+        Paired {
+            mut a,
+            mut b,
+            a_keys,
+            b_keys,
+            pair,
+        },
+    ) = paired_on(backend).await;
     let id = MessageId::generate();
     send_body(&mut a, &a_keys, id, Lane::Data, &event("hello")).await;
     assert_eq!(accepted(&mut a).await, Position(1));
@@ -195,16 +194,17 @@ async fn sealed_message_round_trip_with_ack() {
     a.close().await;
 }
 
-#[tokio::test]
-async fn unacked_messages_are_resent_after_reconnect() {
-    let server = Server::start().await;
-    let Paired {
-        mut a,
-        b,
-        a_keys,
-        b_keys,
-        pair,
-    } = paired(&server).await;
+async fn unacked_messages_are_resent_after_reconnect(backend: Backend) {
+    let (
+        server,
+        Paired {
+            mut a,
+            b,
+            a_keys,
+            b_keys,
+            pair,
+        },
+    ) = paired_on(backend).await;
     let b_device = b.keys.device_id();
     let keys = b.disconnect().await;
     for text in ["one", "two", "three"] {
@@ -234,15 +234,16 @@ async fn unacked_messages_are_resent_after_reconnect() {
     assert_eq!(texts, [event("one"), event("two"), event("three")]);
 }
 
-#[tokio::test]
-async fn retry_returns_the_same_position_and_conflict_is_reported() {
-    let server = Server::start().await;
-    let Paired {
-        mut a,
-        mut b,
-        a_keys,
-        ..
-    } = paired(&server).await;
+async fn retry_returns_the_same_position_and_conflict_is_reported(backend: Backend) {
+    let (
+        _server,
+        Paired {
+            mut a,
+            mut b,
+            a_keys,
+            ..
+        },
+    ) = paired_on(backend).await;
     let id = MessageId::generate();
     let sealed = a_keys.seal_message(id, Lane::Control, &event("x")).unwrap();
     let frame = ClientFrame::Send {
@@ -265,16 +266,17 @@ async fn retry_returns_the_same_position_and_conflict_is_reported() {
     );
 }
 
-#[tokio::test]
-async fn live_updates_reach_an_online_peer() {
-    let server = Server::start().await;
-    let Paired {
-        mut a,
-        mut b,
-        a_keys,
-        b_keys,
-        pair,
-    } = paired(&server).await;
+async fn live_updates_reach_an_online_peer(backend: Backend) {
+    let (
+        _server,
+        Paired {
+            mut a,
+            mut b,
+            a_keys,
+            b_keys,
+            pair,
+        },
+    ) = paired_on(backend).await;
     let update = LiveBody {
         stream: StreamId::from_bytes([2; 16]),
         data: json!("tok"),
@@ -293,16 +295,17 @@ async fn live_updates_reach_an_online_peer() {
     assert_eq!(b_keys.open_live(&sealed).unwrap(), update);
 }
 
-#[tokio::test]
-async fn unpair_stops_all_traffic() {
-    let server = Server::start().await;
-    let Paired {
-        mut a,
-        mut b,
-        a_keys,
-        pair,
-        ..
-    } = paired(&server).await;
+async fn unpair_stops_all_traffic(backend: Backend) {
+    let (
+        _server,
+        Paired {
+            mut a,
+            mut b,
+            a_keys,
+            pair,
+            ..
+        },
+    ) = paired_on(backend).await;
     b.send(&ClientFrame::Unpair { pair }).await;
     expect_pair(&mut b, pair, PairState::Revoked).await;
     expect_pair(&mut a, pair, PairState::Revoked).await;
@@ -333,10 +336,8 @@ async fn unpair_stops_all_traffic() {
     b.expect_quiet(Duration::from_millis(200)).await;
 }
 
-#[tokio::test]
-async fn presence_follows_connections() {
-    let server = Server::start().await;
-    let Paired { mut a, b, pair, .. } = paired(&server).await;
+async fn presence_follows_connections(backend: Backend) {
+    let (server, Paired { mut a, b, pair, .. }) = paired_on(backend).await;
     let keys = b.disconnect().await;
     let offline = a
         .recv_where(|f| matches!(f, ServerFrame::Presence { online: false, .. }))
@@ -351,9 +352,8 @@ async fn presence_follows_connections() {
     assert!(matches!(online, ServerFrame::Presence { pair: p, .. } if p == pair));
 }
 
-#[tokio::test]
-async fn new_connection_replaces_the_old_one() {
-    let server = Server::start().await;
+async fn new_connection_replaces_the_old_one(backend: Backend) {
+    let server = Server::on(backend, |_| {}).await;
     let keys = DeviceKeys::generate();
     let secret = keys.to_secret();
     let (mut first, _) = Client::connect(&server.url, keys).await;
@@ -361,9 +361,8 @@ async fn new_connection_replaces_the_old_one() {
     assert_eq!(first.recv().await, None);
 }
 
-#[tokio::test]
-async fn bad_frames_get_errors_and_the_connection_survives() {
-    let server = Server::with(|c| c.limits.max_sealed_bytes = 8).await;
+async fn bad_frames_get_errors_and_the_connection_survives(backend: Backend) {
+    let server = Server::on(backend, |c| c.limits.max_sealed_bytes = 8).await;
     let Paired {
         mut a,
         a_keys,
@@ -411,9 +410,8 @@ async fn bad_frames_get_errors_and_the_connection_survives() {
     );
 }
 
-#[tokio::test]
-async fn delivery_window_limits_messages_in_flight() {
-    let server = Server::with(|c| {
+async fn delivery_window_limits_messages_in_flight(backend: Backend) {
+    let server = Server::on(backend, |c| {
         c.limits.delivery_window = 2;
         c.limits.fetch_batch = 2;
     })
@@ -449,9 +447,8 @@ async fn delivery_window_limits_messages_in_flight() {
     assert_eq!(delivered(&mut b).await.2, Position(4));
 }
 
-#[tokio::test]
-async fn frame_rate_is_limited() {
-    let server = Server::with(|c| {
+async fn frame_rate_is_limited(backend: Backend) {
+    let server = Server::on(backend, |c| {
         c.limits.frame_burst = 2;
         c.limits.frames_per_second = 1;
     })
@@ -478,9 +475,8 @@ async fn frame_rate_is_limited() {
     );
 }
 
-#[tokio::test]
-async fn overdue_invitations_expire_and_are_announced() {
-    let server = Server::with(|c| {
+async fn overdue_invitations_expire_and_are_announced(backend: Backend) {
+    let server = Server::on(backend, |c| {
         c.timeouts.invite = Duration::ZERO;
         c.timeouts.sweep = Duration::from_millis(20);
     })
@@ -495,9 +491,8 @@ async fn overdue_invitations_expire_and_are_announced() {
     expect_pair(&mut a, invitation.pair, PairState::Expired).await;
 }
 
-#[tokio::test]
-async fn health_check_and_graceful_shutdown() {
-    let mut server = Server::start().await;
+async fn health_check_and_graceful_shutdown(backend: Backend) {
+    let mut server = Server::on(backend, |_| {}).await;
     let mut stream = tokio::net::TcpStream::connect(server.http_address())
         .await
         .unwrap();
@@ -546,12 +541,13 @@ async fn upload(
     );
 }
 
-#[tokio::test]
-async fn artifact_upload_and_download_over_websocket() {
-    let server = Server::start().await;
-    let Paired {
-        mut a, mut b, pair, ..
-    } = paired(&server).await;
+async fn artifact_upload_and_download_over_websocket(backend: Backend) {
+    let (
+        _server,
+        Paired {
+            mut a, mut b, pair, ..
+        },
+    ) = paired_on(backend).await;
     let key = wici_crypto::ArtifactKey::generate();
     upload(&mut a, pair, &key, b"picture").await;
 
@@ -587,9 +583,8 @@ async fn artifact_upload_and_download_over_websocket() {
     );
 }
 
-#[tokio::test]
-async fn oversized_artifact_chunk_is_rejected() {
-    let server = Server::with(|c| c.limits.max_chunk_bytes = 4).await;
+async fn oversized_artifact_chunk_is_rejected(backend: Backend) {
+    let server = Server::on(backend, |c| c.limits.max_chunk_bytes = 4).await;
     let Paired { mut a, pair, .. } = paired(&server).await;
     a.send(&ClientFrame::ArtifactPut {
         pair,
@@ -605,3 +600,24 @@ async fn oversized_artifact_chunk_is_rejected() {
         Some(ErrorCode::LimitExceeded)
     );
 }
+
+on_every_backend!(
+    handshake_rejects_bad_signature_version_and_order,
+    handshake_times_out,
+    answered_pings_keep_an_idle_connection_open,
+    silent_connection_idles_out,
+    sealed_message_round_trip_with_ack,
+    unacked_messages_are_resent_after_reconnect,
+    retry_returns_the_same_position_and_conflict_is_reported,
+    live_updates_reach_an_online_peer,
+    unpair_stops_all_traffic,
+    presence_follows_connections,
+    new_connection_replaces_the_old_one,
+    bad_frames_get_errors_and_the_connection_survives,
+    delivery_window_limits_messages_in_flight,
+    frame_rate_is_limited,
+    overdue_invitations_expire_and_are_announced,
+    health_check_and_graceful_shutdown,
+    artifact_upload_and_download_over_websocket,
+    oversized_artifact_chunk_is_rejected,
+);

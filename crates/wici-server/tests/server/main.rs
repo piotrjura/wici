@@ -1,4 +1,9 @@
-//! Server tests against a real PostgreSQL. Run through `scripts/with-postgres.sh`.
+//! Server tests against real PostgreSQL and SQLite. Run through
+//! `scripts/with-postgres.sh`.
+#![expect(
+    clippy::cognitive_complexity,
+    reason = "a contract test walks one flow through many steps"
+)]
 
 #[cfg(test)]
 mod client;

@@ -13,14 +13,37 @@ pub(crate) const LIMITS: StoreLimits = StoreLimits {
 
 pub(crate) const TTL: Duration = Duration::from_secs(60);
 
+pub(crate) use wici_testkit::Backend;
+
+/// Runs each listed `async fn name(backend: Backend)` once per backend, as
+/// the tests `name::postgres` and `name::sqlite`.
+macro_rules! on_every_backend {
+    ($($test:ident),+ $(,)?) => {
+        $(mod $test {
+            #[tokio::test]
+            async fn postgres() {
+                super::$test(crate::support::Backend::Postgres).await;
+            }
+
+            #[tokio::test]
+            async fn sqlite() {
+                super::$test(crate::support::Backend::Sqlite).await;
+            }
+        })+
+    };
+}
+pub(crate) use on_every_backend;
+
 /// Creates a fresh database and a store connected to it.
-pub(crate) async fn store() -> Store {
-    store_with(LIMITS).await
+pub(crate) async fn store(backend: Backend) -> Store {
+    store_with(backend, LIMITS).await
 }
 
 /// [`store`] with custom limits.
-pub(crate) async fn store_with(limits: StoreLimits) -> Store {
-    wici_testkit::store(limits).await
+pub(crate) async fn store_with(backend: Backend, limits: StoreLimits) -> Store {
+    let store = wici_testkit::store(backend, limits).await;
+    assert_eq!(store.backend(), backend);
+    store
 }
 
 /// A registered device with real keys.
@@ -28,6 +51,15 @@ pub(crate) async fn device(store: &Store) -> DeviceKeys {
     let keys = DeviceKeys::generate();
     store.touch_device(&keys.device_id()).await.unwrap();
     keys
+}
+
+/// A fresh store, two devices, and an invitation from the first.
+pub(crate) async fn invited(backend: Backend) -> (Store, DeviceKeys, DeviceKeys, Invitation) {
+    let store = store(backend).await;
+    let a = device(&store).await;
+    let b = device(&store).await;
+    let invitation = invite(&store, &a).await;
+    (store, a, b, invitation)
 }
 
 /// An invitation from `inviter`, stored on the server.

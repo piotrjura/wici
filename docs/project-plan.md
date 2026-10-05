@@ -33,7 +33,7 @@ in real time, end-to-end encrypted, through a relay server. Wici guarantees:
 | --- | --- |
 | `wici-protocol` | IDs, frames, bodies, lifecycles, validation |
 | `wici-crypto` | Device keys, pairing, sealing, local vault, artifacts |
-| `wici-server` | Relay: auth, pairing, routing, storage (PostgreSQL) |
+| `wici-server` | Relay: auth, pairing, routing, storage (PostgreSQL or SQLite) |
 | `wici-client` | Device side: outbox, inbox, reconnect (SQLite) |
 | `wici-ffi` | C ABI for native apps: JSON requests and events |
 | `wici-load` | Load test with simulated device pairs |
@@ -42,6 +42,13 @@ in real time, end-to-end encrypted, through a relay server. Wici guarantees:
 `swift/` holds `WiciKit`, a Swift package over the C ABI.
 
 Add a crate only when code needs it. Protocol and crypto know nothing of I/O.
+
+Server storage rules are shared and call an adapter trait. Each database is
+one adapter, and both pass the same tests:
+
+- PostgreSQL: many server processes on one database. Row locks order writers.
+- SQLite: one server process, one file. One writer connection orders writes,
+  read-only connections serve reads. WAL with full sync.
 
 ## Devices and pairing
 
@@ -113,7 +120,7 @@ A live update carries a stream ID and data.
 
 - The client saves a message in its outbox before it sends. Retries resend
   the same ID and sealed bytes.
-- The server acknowledges only after the PostgreSQL commit.
+- The server acknowledges only after the database commit.
 - The server deduplicates by pair + sender + ID + payload hash. A reused ID
   with a new payload or lane returns `conflict`.
 - Positions are per pair, recipient, and lane. They start at 1 and have no
@@ -211,7 +218,8 @@ Planned: push notification hints with no content for offline devices.
 Every queue, buffer, payload, artifact, pair count, and rate is bounded.
 Hitting a limit returns an explicit error. Library users set limits in
 `Limits`, `Timeouts`, and `ClientConfig`. The server binary reads only
-`WICI_DATABASE_URL`, `WICI_LISTEN`, and `WICI_DATABASE_CONNECTIONS`.
+`WICI_DATABASE_URL` (`postgres://...` or `sqlite:path`), `WICI_LISTEN`, and
+`WICI_DATABASE_CONNECTIONS`.
 
 ## Build order
 
@@ -225,6 +233,7 @@ Done:
 6. Presence.
 7. C ABI and Swift package.
 8. Load test.
+9. SQLite server adapter: run the relay from one file, no database server.
 
 Next:
 

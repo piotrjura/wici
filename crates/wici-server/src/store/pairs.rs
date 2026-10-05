@@ -1,112 +1,18 @@
-//! Pairing: invite, claim, approve, unpair, expire.
+//! Pairing rules: invite, claim, approve, unpair, expire.
 
 use std::time::Duration;
 
-use sqlx::postgres::PgRow;
-use sqlx::{PgConnection, Postgres, Row, Transaction};
+use sqlx::{Database, Transaction};
 use subtle::ConstantTimeEq;
-use wici_protocol::{Blob, DeviceId, FixedBytes, Lifecycle, PairId, PairState, WireEnum};
+use wici_protocol::{Blob, DeviceId, FixedBytes, Lifecycle, PairId, PairState};
 
-use super::{
-    PairRecord, Store, StoreError, StoreResult, device_from, lock_device, millis_of, pair_id_from,
-    pg_uuid, timestamp, wire_from,
+use super::adapter::{Adapter, LockMode};
+use super::sql::Exec;
+use super::sql::pairs::{
+    Locked, PairChange, count_open_pairs, create_lanes, delete_pair_data, expire_due, insert_pair,
+    lock_device, lock_pair, pairs_of, update_pair,
 };
-
-fn pair_columns() -> String {
-    format!(
-        "id, state, inviter, invitee, greeting, claim_hash, \
-         coalesce(expires_at <= now(), false) AS due, {} AS expires_ms",
-        millis_of("expires_at")
-    )
-}
-
-/// Pair row plus server-only fields.
-pub(super) struct Locked {
-    pub(super) record: PairRecord,
-    claim_hash: Vec<u8>,
-    due: bool,
-}
-
-/// Row lock strength.
-#[derive(Clone, Copy)]
-pub(super) enum LockMode {
-    /// Blocks other writers and sharers.
-    Update,
-    /// Blocks writers only.
-    Share,
-}
-
-fn locked_from(row: &PgRow) -> StoreResult<Locked> {
-    let state: String = row.try_get("state")?;
-    let first: Vec<u8> = row.try_get("inviter")?;
-    let second: Option<Vec<u8>> = row.try_get("invitee")?;
-    let greeting: Option<Vec<u8>> = row.try_get("greeting")?;
-    Ok(Locked {
-        record: PairRecord {
-            id: pair_id_from(row, "id")?,
-            state: wire_from(&state)?,
-            inviter: device_from(&first)?,
-            invitee: second.as_deref().map(device_from).transpose()?,
-            greeting: greeting.map(Blob::new),
-            expires_at: timestamp(row.try_get("expires_ms")?),
-        },
-        claim_hash: row.try_get("claim_hash")?,
-        due: row.try_get("due")?,
-    })
-}
-
-/// Reads and locks a pair row until the transaction ends.
-pub(super) async fn lock(
-    conn: &mut PgConnection,
-    pair: PairId,
-    mode: LockMode,
-) -> StoreResult<Locked> {
-    let mode = match mode {
-        LockMode::Update => "UPDATE",
-        LockMode::Share => "SHARE",
-    };
-    let row = sqlx::query(&format!(
-        "SELECT {} FROM pairs WHERE id = $1 FOR {mode}",
-        pair_columns()
-    ))
-    .bind(pg_uuid(pair.as_bytes()))
-    .fetch_optional(conn)
-    .await?
-    .ok_or(StoreError::NotFound)?;
-    locked_from(&row)
-}
-
-/// Moves a pair to `next` if the lifecycle allows it. `ttl` sets a new
-/// deadline. `claim` sets the invitee and greeting. Other states drop the
-/// greeting.
-async fn transition(
-    conn: &mut PgConnection,
-    current: &PairRecord,
-    next: PairState,
-    ttl: Option<Duration>,
-    claim: Option<(&DeviceId, &Blob)>,
-) -> StoreResult<PairRecord> {
-    current
-        .state
-        .transition_to(next)
-        .map_err(|_| StoreError::Forbidden)?;
-    let row = sqlx::query(&format!(
-        "UPDATE pairs SET state = $2, updated_at = now(), \
-         expires_at = CASE WHEN $3::FLOAT8 IS NULL THEN NULL ELSE now() + make_interval(secs => $3) END, \
-         invitee = coalesce($4, invitee), \
-         greeting = CASE WHEN $2 = 'claimed' THEN $5 ELSE NULL END \
-         WHERE id = $1 RETURNING {}",
-        pair_columns()
-    ))
-    .bind(pg_uuid(current.id.as_bytes()))
-    .bind(next.as_str())
-    .bind(ttl.map(|t| t.as_secs_f64()))
-    .bind(claim.map(|(device, _)| device.as_bytes().to_vec()))
-    .bind(claim.map(|(_, greeting)| greeting.as_bytes().to_vec()))
-    .fetch_one(conn)
-    .await?;
-    Ok(locked_from(&row)?.record)
-}
+use super::{Adapters, PairRecord, Store, StoreError, StoreLimits, StoreResult, dispatch};
 
 /// A claim of an invitation.
 #[derive(Debug, Clone, Copy)]
@@ -126,18 +32,8 @@ impl Store {
     ///
     /// [`StoreError::Database`] on failure.
     pub async fn pairs_of(&self, id: &DeviceId) -> StoreResult<Vec<PairRecord>> {
-        let rows = sqlx::query(&format!(
-            "SELECT {} FROM pairs WHERE (inviter = $1 OR invitee = $1) \
-             AND (state IN ('invited', 'claimed', 'active') OR updated_at > now() - interval '1 day') \
-             ORDER BY created_at DESC",
-            pair_columns()
-        ))
-        .bind(id.as_bytes().as_slice())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter()
-            .map(|row| Ok(locked_from(row)?.record))
-            .collect()
+        dispatch!(self, |a| pairs_of(&mut *a.reader().acquire().await?, id)
+            .await)
     }
 
     /// Creates an invitation. Repeating it with the same hash is a no-op.
@@ -153,45 +49,13 @@ impl Store {
         claim_hash: &FixedBytes<32>,
         ttl: Duration,
     ) -> StoreResult<PairRecord> {
-        let mut tx = self.pool.begin().await?;
-        lock_device(&mut tx, inviter).await?;
-        if let Some(existing) = lock(&mut tx, pair, LockMode::Update)
-            .await
-            .map(Some)
-            .or_else(not_found_as_none)?
-        {
-            let same =
-                existing.record.inviter == *inviter && existing.claim_hash == claim_hash.as_bytes();
-            return if same {
-                Ok(existing.record)
-            } else {
-                Err(StoreError::Conflict)
-            };
-        }
-        let open: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pairs WHERE (inviter = $1 OR invitee = $1) \
-             AND state IN ('invited', 'claimed', 'active')",
-        )
-        .bind(inviter.as_bytes().as_slice())
-        .fetch_one(&mut *tx)
-        .await?;
-        if open >= self.limits.max_pairs_per_device {
-            return Err(StoreError::LimitExceeded);
-        }
-        let row = sqlx::query(&format!(
-            "INSERT INTO pairs (id, state, inviter, claim_hash, expires_at) \
-             VALUES ($1, 'invited', $2, $3, now() + make_interval(secs => $4)) RETURNING {}",
-            pair_columns()
-        ))
-        .bind(pg_uuid(pair.as_bytes()))
-        .bind(inviter.as_bytes().as_slice())
-        .bind(claim_hash.as_bytes().as_slice())
-        .bind(ttl.as_secs_f64())
-        .fetch_one(&mut *tx)
-        .await?;
-        let record = locked_from(&row)?.record;
-        tx.commit().await?;
-        Ok(record)
+        let request = Invite {
+            inviter,
+            pair,
+            claim_hash,
+            ttl,
+        };
+        dispatch!(self, |a| invite(a, self.limits, &request).await)
     }
 
     /// Claims an invitation. A repeated claim by the same device is a no-op.
@@ -206,39 +70,7 @@ impl Store {
         claim: &Claim<'_>,
         ttl: Duration,
     ) -> StoreResult<PairRecord> {
-        let Claim {
-            pair,
-            claim_hash,
-            greeting,
-        } = *claim;
-        let mut tx = self.pool.begin().await?;
-        let locked = lock(&mut tx, pair, LockMode::Update).await?;
-        let record = &locked.record;
-        let secret_ok = bool::from(locked.claim_hash.as_slice().ct_eq(claim_hash.as_bytes()));
-        if !secret_ok || record.inviter == *invitee {
-            return Err(StoreError::Forbidden);
-        }
-        // Same device, right secret: a retry. Keep the first greeting.
-        let repeat = record.state == PairState::Claimed && record.invitee == Some(*invitee);
-        if repeat {
-            return Ok(locked.record);
-        }
-        if record.state != PairState::Invited {
-            return Err(StoreError::Forbidden);
-        }
-        if locked.due {
-            return Err(save_expiry(tx, record).await);
-        }
-        let record = transition(
-            &mut tx,
-            record,
-            PairState::Claimed,
-            Some(ttl),
-            Some((invitee, greeting)),
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(record)
+        dispatch!(self, |a| self::claim(a, invitee, claim, ttl).await)
     }
 
     /// Approves a claimed pair. Inviter only. Repeating it is a no-op.
@@ -248,36 +80,7 @@ impl Store {
     /// [`StoreError::Forbidden`] for non-inviters or wrong state,
     /// [`StoreError::Expired`] after the deadline. The expiry is saved.
     pub async fn approve(&self, inviter: &DeviceId, pair: PairId) -> StoreResult<PairRecord> {
-        let mut tx = self.pool.begin().await?;
-        let locked = lock(&mut tx, pair, LockMode::Update).await?;
-        let record = &locked.record;
-        if record.inviter != *inviter {
-            return Err(StoreError::Forbidden);
-        }
-        if record.state == PairState::Active {
-            return Ok(locked.record);
-        }
-        if record.state == PairState::Claimed && locked.due {
-            return Err(save_expiry(tx, record).await);
-        }
-        let record = transition(&mut tx, record, PairState::Active, None, None).await?;
-        sqlx::query(
-            "INSERT INTO lanes (pair_id, recipient, lane) \
-             SELECT $1, member, lane FROM unnest($2::BYTEA[]) AS member \
-             CROSS JOIN unnest(ARRAY['control', 'data']) AS lane",
-        )
-        .bind(pg_uuid(pair.as_bytes()))
-        .bind(
-            record
-                .members()
-                .iter()
-                .map(|d| d.as_bytes().to_vec())
-                .collect::<Vec<_>>(),
-        )
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(record)
+        dispatch!(self, |a| approve(a, inviter, pair).await)
     }
 
     /// Revokes a pair and deletes its queued messages and artifacts. Either member.
@@ -287,23 +90,7 @@ impl Store {
     ///
     /// [`StoreError::Forbidden`] for non-members or expired pairs.
     pub async fn unpair(&self, member: &DeviceId, pair: PairId) -> StoreResult<PairRecord> {
-        let mut tx = self.pool.begin().await?;
-        let locked = lock(&mut tx, pair, LockMode::Update).await?;
-        if !locked.record.members().contains(member) {
-            return Err(StoreError::Forbidden);
-        }
-        if locked.record.state == PairState::Revoked {
-            return Ok(locked.record);
-        }
-        let record = transition(&mut tx, &locked.record, PairState::Revoked, None, None).await?;
-        for table in ["lanes", "artifacts"] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE pair_id = $1"))
-                .bind(pg_uuid(pair.as_bytes()))
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(record)
+        dispatch!(self, |a| unpair(a, member, pair).await)
     }
 
     /// Marks up to `limit` overdue invitations and claims as expired.
@@ -312,38 +99,182 @@ impl Store {
     ///
     /// [`StoreError::Database`] on failure.
     pub async fn expire_due(&self, limit: i64) -> StoreResult<Vec<PairRecord>> {
-        let rows = sqlx::query(&format!(
-            "UPDATE pairs SET state = 'expired', expires_at = NULL, greeting = NULL, updated_at = now() \
-             WHERE id IN (SELECT id FROM pairs WHERE state IN ('invited', 'claimed') \
-             AND expires_at <= now() ORDER BY expires_at LIMIT $1 FOR UPDATE SKIP LOCKED) \
-             RETURNING {}",
-            pair_columns()
-        ))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter()
-            .map(|row| Ok(locked_from(row)?.record))
-            .collect()
+        dispatch!(self, |a| {
+            expire_due(&mut *a.writer().acquire().await?, limit).await
+        })
     }
+}
+
+/// Reads and locks a pair row until the transaction ends.
+pub(super) async fn lock(
+    conn: &mut impl Exec,
+    pair: PairId,
+    mode: LockMode,
+) -> StoreResult<Locked> {
+    lock_pair(conn, pair, mode)
+        .await?
+        .ok_or(StoreError::NotFound)
+}
+
+/// Starts a write transaction and locks the pair for update.
+async fn begin_locked<A: Adapter>(
+    adapter: &A,
+    pair: PairId,
+) -> StoreResult<(Transaction<'static, A::Db>, Locked)> {
+    let mut tx = adapter.writer().begin().await?;
+    let locked = lock(&mut *tx, pair, LockMode::Update).await?;
+    Ok((tx, locked))
+}
+
+/// Moves a pair to `change.state` if the lifecycle allows it.
+async fn transition(
+    conn: &mut impl Exec,
+    current: &PairRecord,
+    change: PairChange<'_>,
+) -> StoreResult<PairRecord> {
+    current
+        .state
+        .transition_to(change.state)
+        .map_err(|_| StoreError::Forbidden)?;
+    update_pair(conn, current.id, change).await
+}
+
+/// A state change without deadline or claim.
+const fn plain(state: PairState) -> PairChange<'static> {
+    PairChange {
+        state,
+        ttl: None,
+        claim: None,
+    }
+}
+
+/// An invitation to store.
+struct Invite<'a> {
+    inviter: &'a DeviceId,
+    pair: PairId,
+    claim_hash: &'a FixedBytes<32>,
+    ttl: Duration,
+}
+
+async fn invite<A: Adapter>(
+    adapter: &A,
+    limits: StoreLimits,
+    request: &Invite<'_>,
+) -> StoreResult<PairRecord> {
+    let Invite {
+        inviter,
+        pair,
+        claim_hash,
+        ttl,
+    } = *request;
+    let mut tx = adapter.writer().begin().await?;
+    lock_device(&mut *tx, inviter).await?;
+    if let Some(existing) = lock_pair(&mut *tx, pair, LockMode::Update).await? {
+        let same =
+            existing.record.inviter == *inviter && existing.claim_hash == claim_hash.as_bytes();
+        return if same {
+            Ok(existing.record)
+        } else {
+            Err(StoreError::Conflict)
+        };
+    }
+    if count_open_pairs(&mut *tx, inviter).await? >= limits.max_pairs_per_device {
+        return Err(StoreError::LimitExceeded);
+    }
+    let record = insert_pair(&mut *tx, pair, inviter, claim_hash, ttl).await?;
+    tx.commit().await?;
+    Ok(record)
+}
+
+async fn claim<A: Adapter>(
+    adapter: &A,
+    invitee: &DeviceId,
+    claim: &Claim<'_>,
+    ttl: Duration,
+) -> StoreResult<PairRecord> {
+    let (mut tx, locked) = begin_locked(adapter, claim.pair).await?;
+    let record = &locked.record;
+    let secret_ok = bool::from(
+        locked
+            .claim_hash
+            .as_slice()
+            .ct_eq(claim.claim_hash.as_bytes()),
+    );
+    if !secret_ok || record.inviter == *invitee {
+        return Err(StoreError::Forbidden);
+    }
+    // Same device, right secret: a retry. Keep the first greeting.
+    let repeat = record.state == PairState::Claimed && record.invitee == Some(*invitee);
+    if repeat {
+        return Ok(locked.record);
+    }
+    if record.state != PairState::Invited {
+        return Err(StoreError::Forbidden);
+    }
+    if locked.due {
+        return Err(save_expiry(tx, record).await);
+    }
+    let change = PairChange {
+        state: PairState::Claimed,
+        ttl: Some(ttl),
+        claim: Some((invitee, claim.greeting)),
+    };
+    let record = transition(&mut *tx, record, change).await?;
+    tx.commit().await?;
+    Ok(record)
+}
+
+async fn approve<A: Adapter>(
+    adapter: &A,
+    inviter: &DeviceId,
+    pair: PairId,
+) -> StoreResult<PairRecord> {
+    let (mut tx, locked) = begin_locked(adapter, pair).await?;
+    let record = &locked.record;
+    if record.inviter != *inviter {
+        return Err(StoreError::Forbidden);
+    }
+    if record.state == PairState::Active {
+        return Ok(locked.record);
+    }
+    if record.state == PairState::Claimed && locked.due {
+        return Err(save_expiry(tx, record).await);
+    }
+    let record = transition(&mut *tx, record, plain(PairState::Active)).await?;
+    create_lanes(&mut *tx, pair, &record.members()).await?;
+    tx.commit().await?;
+    Ok(record)
+}
+
+async fn unpair<A: Adapter>(
+    adapter: &A,
+    member: &DeviceId,
+    pair: PairId,
+) -> StoreResult<PairRecord> {
+    let (mut tx, locked) = begin_locked(adapter, pair).await?;
+    if !locked.record.members().contains(member) {
+        return Err(StoreError::Forbidden);
+    }
+    if locked.record.state == PairState::Revoked {
+        return Ok(locked.record);
+    }
+    let record = transition(&mut *tx, &locked.record, plain(PairState::Revoked)).await?;
+    delete_pair_data(&mut *tx, pair).await?;
+    tx.commit().await?;
+    Ok(record)
 }
 
 /// Commits the pair as expired and returns [`StoreError::Expired`], or the
 /// error that stopped the commit.
-async fn save_expiry(mut tx: Transaction<'_, Postgres>, record: &PairRecord) -> StoreError {
-    if let Err(error) = transition(&mut tx, record, PairState::Expired, None, None).await {
+async fn save_expiry<Db: Database<Connection: Exec>>(
+    mut tx: Transaction<'static, Db>,
+    record: &PairRecord,
+) -> StoreError {
+    if let Err(error) = transition(&mut *tx, record, plain(PairState::Expired)).await {
         return error;
     }
     match tx.commit().await {
         Ok(()) => StoreError::Expired,
         Err(error) => error.into(),
-    }
-}
-
-fn not_found_as_none(error: StoreError) -> StoreResult<Option<Locked>> {
-    if matches!(error, StoreError::NotFound) {
-        Ok(None)
-    } else {
-        Err(error)
     }
 }
