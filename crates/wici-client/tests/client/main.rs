@@ -4,4 +4,6 @@
 #[cfg(test)]
 mod flows;
 #[cfg(test)]
+mod keepalive;
+#[cfg(test)]
 mod support;
