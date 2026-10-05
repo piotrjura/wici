@@ -352,6 +352,20 @@ async fn presence_follows_connections() {
 }
 
 #[tokio::test]
+async fn replaced_connection_does_not_announce_offline() {
+    let server = Server::start().await;
+    let Paired { mut a, b, .. } = paired(&server).await;
+    let secret = b.keys.to_secret();
+    let (_b, _) = Client::connect(&server.url, DeviceKeys::from_secret(&secret)).await;
+    let offline = a
+        .recv_presence_within(Duration::from_millis(500))
+        .await
+        .into_iter()
+        .any(|f| matches!(f, ServerFrame::Presence { online: false, .. }));
+    assert!(!offline, "the old connection announced offline");
+}
+
+#[tokio::test]
 async fn new_connection_replaces_the_old_one() {
     let server = Server::start().await;
     let keys = DeviceKeys::generate();

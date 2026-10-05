@@ -87,6 +87,7 @@ Planned: each side lists the operations it accepts. The app defines them.
 - The device signs a server challenge within 10 s to connect.
 - Server pushes every frame on arrival. Pings every 20 s. A connection with no
   frame for 60 s closes.
+- A replaced connection does not announce the device offline.
 - Frames carry pairing, messages, acks, live updates, presence, artifacts,
   and errors.
 - Each lane has its own order, so output never delays control.
