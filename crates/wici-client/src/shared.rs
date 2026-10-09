@@ -25,6 +25,8 @@ pub(crate) struct Shared {
     pub(crate) wake: Notify,
     /// Skips the reconnect delay.
     pub(crate) reconnect: Notify,
+    /// Discards the connection when a queued artifact caller leaves.
+    pub(crate) request_reset: Notify,
     pub(crate) stop: CancellationToken,
     events: mpsc::Sender<Event>,
     pub(crate) live: mpsc::Sender<ClientFrame>,
@@ -55,6 +57,7 @@ impl Shared {
             config,
             wake: Notify::new(),
             reconnect: Notify::new(),
+            request_reset: Notify::new(),
             stop: CancellationToken::new(),
             events: channels.events,
             live: channels.live,
@@ -71,7 +74,11 @@ impl Shared {
 
     /// Sends an event. Waits if the app is slow; drops it if the app is gone.
     pub(crate) async fn emit(&self, event: Event) {
-        let _ = self.events.send(event).await;
+        tokio::select! {
+            biased;
+            () = self.stop.cancelled() => {}
+            _ = self.events.send(event) => {}
+        }
     }
 
     pub(crate) fn seal_invitation(&self, invitation: &Invitation) -> ClientResult<Vec<u8>> {

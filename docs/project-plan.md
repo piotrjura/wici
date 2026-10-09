@@ -103,6 +103,7 @@ Planned: each side lists the operations it accepts. The app defines them.
 - Live updates drop when the peer is offline or its data queue is full. A full
   control queue closes the connection. Durable messages never drop.
 - Rate limit per connection: 100 frames/s, burst 200.
+- Server writes stop on cancellation or after the configured idle timeout.
 
 ## Message bodies
 
@@ -185,6 +186,12 @@ A live update carries a stream ID and data.
   deletes the upload.
 - The peer downloads chunk by chunk and checks the hash.
 - Either device deletes an artifact. A repeated delete does nothing.
+- Rust clients allow 16 outstanding artifact replies and reject overlapping
+  requests for one artifact with `limit_exceeded`. Cancelling or timing out
+  a sent request ends its connection, so late replies cannot reach new work.
+  Chunk request deadlines include local queue wait. No automatic retry.
+- Client deletion returns after local queueing, without a server confirmation.
+  Deletions are not durable across connection loss.
 - Limits: 64 MiB sealed, 256 KiB per chunk frame, 16 unfinished uploads per
   pair.
 - Retention: unfinished uploads go after 24 h, finished artifacts after 7 days.
@@ -205,6 +212,8 @@ Planned: push notification hints with no content for offline devices.
   bytes and the reason. Other lanes and pairs keep working.
 - Never delete data, reset identity or pairing, drop queued work, or bypass
   revocation.
+- Closing a Rust client does not require draining its event queue.
+  Persisted work remains available after reopen.
 
 ## Native apps
 

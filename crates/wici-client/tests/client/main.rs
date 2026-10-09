@@ -6,4 +6,6 @@ mod flows;
 #[cfg(test)]
 mod keepalive;
 #[cfg(test)]
+mod shutdown;
+#[cfg(test)]
 mod support;

@@ -67,7 +67,7 @@ pub struct ClientConfig {
     pub event_buffer: usize,
     /// Largest artifact this client uploads.
     pub max_artifact_bytes: u64,
-    /// Time to wait for a server answer to an artifact request.
+    /// Artifact request deadline, including local queue wait.
     pub request_timeout: Duration,
 }
 
@@ -157,7 +157,8 @@ impl Client {
         ))
     }
 
-    /// Stops the connection task and waits for it.
+    /// Stops the connection task without waiting for the app to drain events.
+    /// Durable work stays in SQLite. Buffered events remain readable.
     pub async fn close(mut self) {
         self.shared.stop.cancel();
         if let Some(task) = self.task.take() {
@@ -392,6 +393,10 @@ impl Client {
     ///
     /// [`ClientError::Offline`] if the connection is down or drops (call
     /// again to resume), [`ClientError::TooLarge`], [`ClientError::Server`].
+    /// At most 16 artifact requests await replies. Overlapping requests for
+    /// one artifact return `limit_exceeded`. A sent request's cancellation
+    /// or deadline ends its connection to discard late replies. Stored
+    /// chunks are not undone or retried automatically.
     pub async fn upload(
         &self,
         pair: PairId,
@@ -409,11 +414,13 @@ impl Client {
     /// [`ClientError::Offline`], [`ClientError::Server`] (for example
     /// `not_found` after deletion), [`ClientError::Corrupt`] or
     /// [`ClientError::Crypto`] for altered data.
+    /// The request limits and cancellation rules of [`Client::upload`] apply.
     pub async fn download(&self, pair: PairId, artifact: &ArtifactRef) -> ClientResult<Vec<u8>> {
         transfer::download(&self.shared, pair, artifact).await
     }
 
-    /// Deletes an artifact on the server. Either device can.
+    /// Queues artifact deletion. Either device can. Success means queued,
+    /// not confirmed by the server. Not durable across connection loss.
     ///
     /// # Errors
     ///

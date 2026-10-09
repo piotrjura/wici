@@ -3,6 +3,19 @@
 Wici connects paired devices: commands, streams, approvals, results, files.
 Read [the plan](docs/project-plan.md) before changing behavior. Never
 call planned work done.
+Use [the code map](docs/code-map.md) to find modules and tests.
+
+## Scope and maintenance
+
+- Work only on the requested task and changes needed to complete it.
+- Inspect the code yourself. Do not require the owner to review implementation details.
+- Preserve unrelated work. Report unrelated problems without expanding the task.
+- Keep affected tests, API docs, code map, and project status current.
+- For bug fixes, add a regression test that reproduces the bug.
+- When responsibilities, entry points, or test locations change, update the code map.
+- Remove stale entries. Link to code and tests instead of copying implementation details.
+- Before finishing, check affected documentation against the final code.
+- Report the result, checks run, and remaining limits. Never claim an unverified result.
 
 ## Writing
 
@@ -81,6 +94,15 @@ scripts/verify.sh
 ```
 
 After Swift or FFI changes, also run `scripts/verify-swift.sh`.
+
+Before merge:
+
+- Run `scripts/verify-merge.sh` on the final merge candidate.
+- All required CI checks must pass, including Linux, macOS, and MSRV.
+- After further edits or conflict resolution, rerun verification.
+- Never skip or weaken checks. Report blockers.
+- Keep verification scripts and CI consistent when requirements change.
+- Commit and merge only when authorized.
 
 ## Commits
 

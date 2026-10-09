@@ -42,6 +42,11 @@ scripts/verify.sh
 Format, Clippy, tests, docs, audit, coverage ≥ 90%, duplicates. Same as CI.
 `scripts/verify-swift.sh` builds the XCFramework and runs the Swift tests.
 
+Before merge, run `scripts/verify-merge.sh` on macOS. It also checks MSRV
+and builds all Apple targets. Install the MSRV toolchain and Rust targets
+listed in `.github/workflows/ci.yml` first. Required Linux and macOS CI
+must also pass. See the [code map](docs/code-map.md) for modules and tests.
+
 ## Load test
 
 ```sh

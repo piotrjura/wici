@@ -14,6 +14,7 @@ use crate::shared::Shared;
 pub(crate) struct Fixture {
     pub(crate) shared: Arc<Shared>,
     pub(crate) events: mpsc::Receiver<Event>,
+    pub(crate) requests: mpsc::Receiver<crate::transfer::Request>,
     /// The peer's view of the pair, to seal messages to this device.
     pub(crate) peer: PairKeys,
     pub(crate) peer_device: DeviceKeys,
@@ -35,7 +36,7 @@ pub(crate) async fn fixture(state: PairState) -> Fixture {
     let peer = invitation.join(&peer_device).unwrap();
     let (events, receiver) = mpsc::channel(64);
     let (live, _) = mpsc::channel(1);
-    let (requests, _) = mpsc::channel(1);
+    let (requests, request_rx) = mpsc::channel(1);
     let config = ClientConfig::new("ws://unused", dir.path().join("client.db"));
     let channels = crate::shared::Channels {
         events,
@@ -58,6 +59,7 @@ pub(crate) async fn fixture(state: PairState) -> Fixture {
     Fixture {
         shared,
         events: receiver,
+        requests: request_rx,
         peer,
         peer_device,
         invitation,
