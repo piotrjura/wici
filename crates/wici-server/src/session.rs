@@ -1,7 +1,6 @@
 //! One WebSocket connection: authentication, reading, writing.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -77,8 +76,7 @@ where
     let (data, data_rx) = mpsc::channel(limits.data_queue);
     let peer = Peer::new(Outbox { control, data }, stop.clone());
     app.hub.register(device, peer.clone());
-    let ping = app.config.timeouts.ping;
-    let writer = tokio::spawn(write(sink, control_rx, data_rx, ping, stop));
+    let writer = tokio::spawn(write(sink, control_rx, data_rx, app.config.timeouts, stop));
     (peer, writer)
 }
 
@@ -203,33 +201,181 @@ pub(crate) async fn write<Si: Sink<Message> + Unpin>(
     mut sink: Si,
     mut control: mpsc::Receiver<ServerFrame>,
     mut data: mpsc::Receiver<ServerFrame>,
-    ping: Duration,
+    timeouts: crate::Timeouts,
     stop: CancellationToken,
 ) {
-    let mut ticker = tokio::time::interval(ping);
+    let mut ticker = tokio::time::interval(timeouts.ping);
     ticker.reset();
     loop {
+        let frame = tokio::select! {
+            biased;
+            () = stop.cancelled() => break,
+            Some(frame) = control.recv() => Some(frame),
+            Some(frame) = data.recv() => Some(frame),
+            _ = ticker.tick() => None,
+        };
+        let sending = async {
+            if let Some(frame) = frame {
+                send(&mut sink, &frame).await
+            } else {
+                sink.send(Message::Ping(Vec::new().into()))
+                    .await
+                    .map_err(|_| ())
+            }
+        };
         let sent = tokio::select! {
             biased;
             () = stop.cancelled() => break,
-            Some(frame) = control.recv() => send(&mut sink, &frame).await,
-            Some(frame) = data.recv() => send(&mut sink, &frame).await,
-            _ = ticker.tick() => sink.send(Message::Ping(Vec::new().into())).await.map_err(|_| ()),
+            result = tokio::time::timeout(timeouts.idle, sending) => result,
         };
-        if sent.is_err() {
+        if !matches!(sent, Ok(Ok(()))) {
             break;
         }
     }
     stop.cancel();
-    let _ = sink.close().await;
+    // Drop the socket. A close handshake can block on the same stalled peer.
 }
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use tokio::sync::Notify;
     use tokio_util::sync::PollSender;
     use wici_protocol::{Blob, PairId};
 
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum Stall {
+        Ready,
+        Flush,
+        Close,
+    }
+
+    struct StalledSink {
+        stall: Stall,
+        polled: Arc<Notify>,
+    }
+
+    impl Sink<Message> for StalledSink {
+        type Error = ();
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            if matches!(self.stall, Stall::Ready) {
+                self.polled.notify_one();
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+        fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), ()> {
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            if matches!(self.stall, Stall::Flush) {
+                self.polled.notify_one();
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            if matches!(self.stall, Stall::Close) {
+                self.polled.notify_one();
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    fn writer_timeouts(ping: Duration) -> crate::Timeouts {
+        crate::Timeouts {
+            ping,
+            idle: Duration::from_secs(1),
+            ..crate::Timeouts::default()
+        }
+    }
+
+    async fn cancelled_writer_finishes(stall: Stall) {
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let (_data_tx, data_rx) = mpsc::channel(1);
+        control_tx.send(live(1)).await.unwrap();
+        let polled = Arc::new(Notify::new());
+        let stop = CancellationToken::new();
+        if matches!(stall, Stall::Close) {
+            stop.cancel();
+        }
+        let mut task = tokio::spawn(write(
+            StalledSink {
+                stall,
+                polled: Arc::clone(&polled),
+            },
+            control_rx,
+            data_rx,
+            writer_timeouts(Duration::from_secs(60)),
+            stop.clone(),
+        ));
+        if !matches!(stall, Stall::Close) {
+            tokio::time::timeout(Duration::from_secs(1), polled.notified())
+                .await
+                .unwrap();
+        }
+        stop.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(250), &mut task).await;
+        if result.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(result.is_ok(), "writer ignored cancellation");
+        result.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_cancels_a_blocked_send() {
+        cancelled_writer_finishes(Stall::Ready).await;
+    }
+
+    #[tokio::test]
+    async fn writer_cancels_a_blocked_flush() {
+        cancelled_writer_finishes(Stall::Flush).await;
+    }
+
+    #[tokio::test]
+    async fn writer_cancels_a_blocked_close() {
+        cancelled_writer_finishes(Stall::Close).await;
+    }
+
+    #[tokio::test]
+    async fn writer_deadline_stops_a_stalled_ping() {
+        let (_control, control_rx) = mpsc::channel(1);
+        let (_data, data_rx) = mpsc::channel(1);
+        let stop = CancellationToken::new();
+        let polled = Arc::new(Notify::new());
+        let task = tokio::spawn(write(
+            StalledSink {
+                stall: Stall::Flush,
+                polled: Arc::clone(&polled),
+            },
+            control_rx,
+            data_rx,
+            crate::Timeouts {
+                ping: Duration::from_millis(5),
+                idle: Duration::from_millis(20),
+                ..crate::Timeouts::default()
+            },
+            stop.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), polled.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stop.is_cancelled());
+    }
 
     fn live(byte: u8) -> ServerFrame {
         ServerFrame::Live {
@@ -258,7 +404,7 @@ mod tests {
             PollSender::new(out_tx),
             control_rx,
             data_rx,
-            Duration::from_secs(60),
+            writer_timeouts(Duration::from_secs(60)),
             stop.clone(),
         ));
         let order: Vec<ServerFrame> = vec![
@@ -281,7 +427,7 @@ mod tests {
             PollSender::new(out_tx),
             control_rx,
             data_rx,
-            Duration::from_millis(10),
+            writer_timeouts(Duration::from_millis(10)),
             stop.clone(),
         ));
         assert!(matches!(out_rx.recv().await, Some(Message::Ping(_))));

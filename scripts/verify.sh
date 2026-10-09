@@ -20,6 +20,7 @@ step() {
 }
 
 step scripts/test-tool-path.sh
+step scripts/test-verify-merge.sh
 
 require cargo-deny "cargo install --locked cargo-deny"
 require cargo-llvm-cov "cargo install --locked cargo-llvm-cov"

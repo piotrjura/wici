@@ -44,22 +44,35 @@ pub(crate) async fn run(
     let config = &shared.config;
     let mut backoff = Backoff::new(config.reconnect_min, config.reconnect_max);
     while !shared.stop.is_cancelled() {
-        if let Ok((socket, pairs)) = connect(&shared).await {
-            backoff.reset();
-            shared.connected.store(true, Ordering::Release);
-            shared.emit(Event::Connected).await;
-            session(&shared, socket, &pairs, &mut inputs).await;
-            shared.connected.store(false, Ordering::Release);
-            // Requests that missed the connection fail now, not on timeout.
-            while inputs.requests.try_recv().is_ok() {}
-            shared.emit(Event::Disconnected).await;
+        tokio::select! {
+            () = shared.stop.cancelled() => break,
+            () = attempt(&shared, &mut inputs, &mut backoff) => {}
         }
         tokio::select! {
-            () = shared.stop.cancelled() => return,
+            () = shared.stop.cancelled() => break,
             () = tokio::time::sleep(backoff.next()) => {}
             () = shared.reconnect.notified() => {}
         }
     }
+    shared.connected.store(false, Ordering::Release);
+}
+
+/// One connection, including event backpressure and request cancellation.
+async fn attempt(shared: &Shared, inputs: &mut Inputs, backoff: &mut Backoff) {
+    let Ok((socket, pairs)) = connect(shared).await else {
+        return;
+    };
+    backoff.reset();
+    shared.connected.store(true, Ordering::Release);
+    shared.emit(Event::Connected).await;
+    tokio::select! {
+        () = shared.request_reset.notified() => {}
+        () = session(shared, socket, &pairs, inputs) => {}
+    }
+    shared.connected.store(false, Ordering::Release);
+    // Requests that missed the connection fail now, not on timeout.
+    while inputs.requests.try_recv().is_ok() {}
+    shared.emit(Event::Disconnected).await;
 }
 
 async fn connect(shared: &Shared) -> Result<(Socket, Vec<PairInfo>), Closed> {
@@ -159,7 +172,7 @@ async fn session(shared: &Shared, socket: Socket, pairs: &[PairInfo], inputs: &m
     {
         let _ = exchange(shared, &mut sink, &mut stream, &mut connection, inputs).await;
     }
-    let _ = sink.close().await;
+    // Drop this connection before accepting replies for new requests.
 }
 
 async fn exchange(
@@ -171,8 +184,9 @@ async fn exchange(
 ) -> Result<(), Closed> {
     let mut timers = Timers::new(&shared.config);
     loop {
-        match next_step(shared, stream, inputs, &mut timers).await {
+        match next_step(shared, stream, inputs, &mut timers, &mut connection.waiters).await {
             Step::Stop => return Ok(()),
+            Step::RequestEnded => return Err(Closed),
             Step::Idle => {
                 tracing::debug!("connection idle");
                 return Err(Closed);
@@ -218,6 +232,7 @@ impl Timers {
 /// What the connection does next.
 enum Step {
     Stop,
+    RequestEnded,
     Idle,
     Message(Option<WsResult>),
     Local(Local),
@@ -237,9 +252,11 @@ async fn next_step(
     stream: &mut Stream,
     inputs: &mut Inputs,
     timers: &mut Timers,
+    waiters: &mut Waiters,
 ) -> Step {
     tokio::select! {
         () = shared.stop.cancelled() => Step::Stop,
+        () = waiters.ended() => Step::RequestEnded,
         () = &mut timers.idle => Step::Idle,
         message = stream.next() => Step::Message(message),
         _ = timers.ping.tick() => Step::Local(Local::Ping),
@@ -265,8 +282,16 @@ async fn send_local(
         Local::Wake => flush(shared, sink, &mut connection.flight).await,
         Local::Live(frame) => write(sink, &frame).await,
         Local::Request(request) => {
+            if let Some(reply) = request.reply {
+                if !connection.waiters.insert(
+                    request.artifact,
+                    reply,
+                    shared.config.request_timeout,
+                ) {
+                    return Ok(());
+                }
+            }
             write(sink, &request.frame).await?;
-            connection.waiters.insert(request.artifact, request.reply);
             Ok(())
         }
         Local::Retry => {
