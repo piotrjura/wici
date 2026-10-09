@@ -64,6 +64,15 @@ Claim only guarantees backed by a failure model and tests.
   stored records, or migrations.
 - License changes need owner approval.
 
+## Rust skills
+
+- Before writing, changing, or reviewing Rust, read and use
+  `rust-best-practices` and `rust-async-patterns` when available.
+- Review new code, changed code, and relevant existing code within the task
+  scope. Before finishing, review the final Rust changes with these skills.
+- If either skill is unavailable, skip it and continue with project rules.
+- Project rules take precedence. Skills do not replace tests or verification.
+
 ## Tests
 
 No code without tests, in the same commit.
