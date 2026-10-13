@@ -1,0 +1,8 @@
+.git
+target
+swift/build
+swift/.build
+.env
+.env.*
+*.pem
+*.key

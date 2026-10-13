@@ -33,6 +33,37 @@ root certificates. Mozilla roots support iOS without a Unix certificate store.
 Certificate and hostname checks remain enabled. Swift packages bundle the
 trust-anchor license in `ThirdPartyNotices.txt`.
 
+### Run with Docker and TLS
+
+The server has no TLS. Clients check certificates, so the server must have a
+public certificate. Caddy gets one from Let's Encrypt and renews it.
+
+Before you start, make sure that:
+
+- a DNS record points your domain, for example `relay.example.com`, to the host
+- ports 80 and 443 are open on the host
+
+Run the server and Caddy on one Docker network:
+
+```sh
+docker build -t wici-server .
+docker network create wici
+docker run -d --name wici --restart unless-stopped --network wici \
+  -v wici-data:/data wici-server
+docker run -d --name caddy --restart unless-stopped --network wici \
+  -p 80:80 -p 443:443 -v caddy-data:/data caddy:2 \
+  caddy reverse-proxy --from relay.example.com --to wici:8080
+```
+
+Check it: `curl https://relay.example.com/health` prints `ok`.
+Clients use `wss://relay.example.com/v1/ws`.
+
+The `wici` container publishes no port, so plain traffic stays inside the
+Docker network. The `caddy-data` volume keeps the certificates. The image
+runs as a non-root user. A bind mount for `/data` must be writable by
+UID 65532. For more than one replica, use PostgreSQL. Use PostgreSQL only in a
+private network, because the server connects to it without TLS.
+
 ## Verify
 
 ```sh

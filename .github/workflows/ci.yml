@@ -96,6 +96,13 @@ jobs:
           node-version: 22
       - run: npx --yes jscpd@4 --config .jscpd.json
 
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/test-docker.sh
+
   swift:
     name: Swift package
     runs-on: macos-latest

@@ -16,6 +16,7 @@ Tests inside source modules cover local rules. The paths below cover wider flows
 | Swift | `swift/Sources/WiciKit/WiciClient.swift` | `swift/Tests/WiciKitTests/` | Bounded events, cancellation, recovery |
 | Load test | `crates/wici-load/src/{lib,user,payload}.rs` | `crates/wici-load/tests/load.rs` | Lost and duplicate message detection |
 | Test helpers | `crates/wici-testkit/src/lib.rs` | Module tests and client/server suites | Real temporary databases and servers |
+| Container image | `Dockerfile`, `.dockerignore` | `scripts/test-docker.sh` | Clean stop, writable data volume |
 | Verification | `scripts/verify*.sh`, `.github/workflows/ci.yml` | `scripts/test-tool-path.sh`, `scripts/test-verify-merge.sh` | Same checks locally and in CI |
 
 ## Verification
