@@ -3,6 +3,7 @@
 Use this map to find code and tests. Public API docs define behavior.
 The [plan](project-plan.md) separates existing behavior from planned work.
 Tests inside source modules cover local rules. The paths below cover wider flows.
+Setup, run, and test commands are in [development](development.md).
 
 | Area | Entry points | Tests | Keep intact |
 | --- | --- | --- | --- |
