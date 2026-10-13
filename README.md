@@ -1,82 +1,59 @@
 # Wici
 
-Rust system that connects paired devices in real time, end-to-end encrypted.
-Commands, streams, approvals, results, and files survive failures.
+A small protocol to send messages between two paired devices. For example,
+an AI agent on a Mac sends its output to a phone, and the phone sends back
+commands and approvals.
 
-Status: early. Server and Rust client work; see the [plan](docs/project-plan.md).
+```mermaid
+flowchart LR
+    subgraph A["Device A: for example an agent on a Mac"]
+        AA[App] <--> AQ[("Local queue<br/>SQLite")]
+    end
+    subgraph S["Wici server: relay"]
+        SR[Routing] <--> SD[("Message store<br/>SQLite or PostgreSQL")]
+    end
+    subgraph B["Device B: for example a phone"]
+        BQ[("Local queue<br/>SQLite")] <--> BA[App]
+    end
 
-## Setup
+    AQ <-->|"WebSocket<br/>encrypted messages"| SR
+    SR <-->|"WebSocket<br/>encrypted messages"| BQ
+```
 
-- Rust from `rust-toolchain.toml` (MSRV 1.85)
-- `cargo install --locked cargo-deny cargo-llvm-cov`
-- Node.js (duplicate check)
-- PostgreSQL binaries (`initdb`, `pg_ctl`) for tests
-- Xcode, for the Swift package
+The path of one message:
 
-Build and verification scripts find Cargo and Homebrew tools in GUI Git
-clients too. If Node is missing from PATH, they try the nvm default.
+```mermaid
+sequenceDiagram
+    participant A as Device A
+    participant S as Server
+    participant B as Device B
+
+    A->>A: Encrypt and save in the queue
+    A->>S: Send
+    S->>S: Save in the database
+    S-->>A: Ack
+    S->>B: Push
+    B->>B: Save in the queue
+    B-->>S: Ack
+    S->>S: Delete the content
+    Note over A,B: No ack: resend with the same ID. The server drops duplicates.<br/>B offline: the server keeps the message and pushes it on reconnect.<br/>Replies (status, approvals, output) take the same path back.
+```
+
+- Devices pair once with a QR code or a link.
+- Messages are end-to-end encrypted. The server cannot read them.
+- Each device keeps a local queue. A lost connection loses no messages.
+- A retry never runs a command twice.
+
+Status: early. The server, the Rust client, and the Swift package work.
+Read the [plan](docs/project-plan.md) for the details and the next steps.
 
 ## Run the server
-
-On one SQLite file, with no database server:
 
 ```sh
 WICI_DATABASE_URL=sqlite:wici.db cargo run --release -p wici-server
 ```
 
-For more than one server process, use PostgreSQL:
-`WICI_DATABASE_URL=postgres://user@host/db`. `WICI_LISTEN` sets the address
-(default `127.0.0.1:8080`).
-
-TLS clients select the `ring` crypto provider and trust native plus Mozilla
-root certificates. Mozilla roots support iOS without a Unix certificate store.
-Certificate and hostname checks remain enabled. Swift packages bundle the
-trust-anchor license in `ThirdPartyNotices.txt`.
-
-## Verify
-
-```sh
-scripts/verify.sh
-```
-
-Format, Clippy, tests, docs, audit, coverage ≥ 90%, duplicates. Same as CI.
-`scripts/verify-swift.sh` builds the XCFramework and runs the Swift tests.
-
-Before merge, run `scripts/verify-merge.sh` on macOS. It also checks MSRV
-and builds all Apple targets. Install the MSRV toolchain and Rust targets
-listed in `.github/workflows/ci.yml` first. Required Linux and macOS CI
-must also pass. See the [code map](docs/code-map.md) for modules and tests.
-
-## Load test
-
-```sh
-scripts/load.sh --users 2500 --active 250 --seconds 120
-```
-
-Runs a release server on a temporary PostgreSQL. Simulated Mac and phone
-pairs send notice, request, and 8 KB snapshot messages. Reports latencies
-and server and database CPU and memory. Fails on lost messages, errors, or
-dropped connections. `--help` lists the options.
-
-## Use from Swift
-
-`swift/` is the `WiciKit` package. Build `swift/build/WiciFFI.xcframework`
-with `scripts/build-xcframework.sh --all`, then add the package.
-
-Consume `client.events` with `for try await`. `eventBufferCapacity` defaults
-to 256. Live updates may drop when full. Other overflow ends the stream with
-`event_overflow`; queued events drain first. Close, reopen with the same
-secret/database, read `pending` and current state, then resume. Mark a message
-`handled` only after processing it.
-
-Call `close()` off the main thread. It waits for callbacks and resolves
-pending calls once. Interrupted calls report `outcome_unknown`: a write may
-have committed. Reconcile durable state before retrying; do not submit the
-same effect with a fresh ID. Task cancellation does not undo accepted work.
-
-The Swift package has transport tests. Sfora Mac/iOS integration and a
-terminal monitor are planned. The real project list and simulator streaming
-have not been tested.
+More: [development](docs/development.md), [code map](docs/code-map.md).
 
 ## License
 
